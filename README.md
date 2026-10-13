@@ -104,6 +104,53 @@ The header shows the notes that are sounding. Notes go to the plugin's first not
 - In terminals that support the kitty keyboard protocol (kitty, foot, WezTerm, Ghostty, Alacritty), and in the Windows console, a note sounds for exactly as long as you hold the key.
 - Everywhere else (GNOME Terminal, xterm, tmux and others), the header says *timed notes*. A tap plays for 0.7 s. Holding the key down keeps the note going through the keyboard's auto-repeat, and the note stops about 0.15 s after you let go. A key can't re-strike its own note until that note has stopped.
 
+## Playing M8 songs
+
+`lextrack m8` plays song files (`.m8s`) from a [Dirtywave M8](https://dirtywave.com) tracker. CLAP plugins take the place of the M8's built-in synths: each M8 instrument the song uses gets its own plugin instance, and the song's notes are sent to it.
+
+```bash
+lextrack m8 MYSONG.m8s --plugin ~/.clap/Surge\ XT.clap      # one plugin for every instrument
+lextrack m8 MYSONG.m8s --map mysong.map                     # a plugin per instrument (see below)
+lextrack m8 MYSONG.m8s --map mysong.map --inst 03=~/.clap/Dexed.clap   # override one instrument
+lextrack m8 MYSONG.m8s --map mysong.map --info              # print the song and the plugin chosen for each instrument
+lextrack m8 MYSONG.m8s --plugin synth.clap --render out.wav --seconds 60   # render to a WAV file
+lextrack m8 examples/demo.m8s --plugin ~/.clap/Surge\ XT.clap   # a short demo song
+```
+
+The screen shows the song rows for the eight tracks, and the chain and phrase of the selected track. Play positions are highlighted as the song plays.
+
+| Key | Action |
+| --- | --- |
+| ↑ / ↓, PgUp / PgDn | Move the song cursor |
+| ← / → | Select a track (its chain and phrase are shown) |
+| Space or Enter | Play from the cursor row, or stop |
+| q / Esc | Quit |
+
+**Instrument maps.** A map file says which plugin plays each instrument, one rule per line. Rules by instrument number win over rules by kind, and kinds win over `default`. `--plugin` sets `default`; `--inst KEY=PLUGIN` adds a rule. Relative paths are relative to the map file. See [`examples/demo.map`](examples/demo.map).
+
+```
+00 = ~/.clap/Surge XT.clap              # instrument 00, in hex as the M8 shows it
+fmsynth = ~/.clap/Dexed.clap            # every FM synth instrument
+0A = ~/.clap/Bundle.clap@com.vendor.x   # a file with several plugins: give the id after @
+default = ~/.clap/Surge XT.clap         # everything else
+```
+
+Kinds are `wavsynth`, `macrosynth`, `sampler`, `midiout` and `fmsynth`.
+
+**How the song is played.**
+
+- Tracks run independently, like on the M8. Each plays its chain on the current song row, then moves to the next row. An empty row sends the track back to the first row of its block, so blocks loop.
+- Timing is 24 ticks per beat. Each phrase step lasts as many ticks as the track's groove says (6 by default). Notes reach the plugin on the exact sample.
+- Each track plays one note at a time. A new note releases the previous one.
+- M8 note C-4 is MIDI note 60 (C-1 is 24). `--note-offset` changes this.
+- The volume column becomes note velocity: `00`-`7F` maps to 0-1, higher values play at full velocity, and an empty volume plays at full velocity.
+- Chain transpose applies to instruments whose TRANSP setting is on.
+- Effects: `DEL` (delay the note), `GRV` (change groove), `HOP` (jump to a phrase step), `KIL` (cut the note) and `TPO` (tempo). Other effects are ignored for now.
+
+**Not supported yet for M8 songs:** instrument tables, the remaining effects, the M8 mixer and send effects, mapping M8 instrument parameters to plugin parameters, saving plugin settings with the song, live/chain/phrase play modes, and editing. Songs from M8 firmware 2.x are supported; m8-js documents the file format up to firmware 2.7, so songs saved by firmware 3 or later have not been tested.
+
+The song reader is a Rust port of [m8-js](https://github.com/whitlockjc/m8-js) by Jeremy Whitlock (Apache License 2.0); see [NOTICE](NOTICE).
+
 ## How it works
 
 - `src/plugin.rs` loads the `.clap` binary and creates the plugin instance. It also implements the host side of the CLAP API (`clap.params`, `clap.log`, `clap.thread-check`, `clap.state`, `clap.audio-ports`).
@@ -112,6 +159,7 @@ The header shows the notes that are sounding. Notes go to the plugin's first not
 - `src/notes.rs` maps computer keys to notes and decides when they stop.
 - `src/ui.rs` holds the terminal UI (ratatui). Values shown on screen are re-read from the plugin about 30 times a second, so changes the plugin makes itself show up too.
 - `src/discovery.rs` finds plugins in the standard CLAP folders.
+- `src/m8/` plays M8 songs: `format.rs` reads `.m8s` files, `sequencer.rs` turns song rows, chains and phrases into note events tick by tick, `rack.rs` runs one plugin per instrument and mixes them, `instruments.rs` reads instrument maps and `app.rs` is the `lextrack m8` command and screen.
 - `test-plugin/` is a tiny test-tone CLAP plugin used for testing. Build it with `cargo build -p lextrack-test-plugin`, then copy `target/debug/liblextrack_test_plugin.so` to `~/.clap/TestTone.clap`.
 
 On Linux and macOS, anything a plugin prints to the console goes to `lextrack-plugin-output.log` in the temp folder, so it doesn't break the display.

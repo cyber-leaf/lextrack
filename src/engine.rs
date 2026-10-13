@@ -415,7 +415,7 @@ pub fn supported_rates(device: Option<&str>) -> Vec<u32> {
         .collect()
 }
 
-fn find_device(name: Option<&str>) -> Result<cpal::Device> {
+pub(crate) fn find_device(name: Option<&str>) -> Result<cpal::Device> {
     let host = cpal::default_host();
     match name {
         None => host
@@ -431,7 +431,10 @@ fn find_device(name: Option<&str>) -> Result<cpal::Device> {
 
 /// The device's default configuration, or the best one at `rate`: stereo
 /// first, then 32-bit float.
-fn pick_config(device: &cpal::Device, rate: Option<u32>) -> Result<cpal::SupportedStreamConfig> {
+pub(crate) fn pick_config(
+    device: &cpal::Device,
+    rate: Option<u32>,
+) -> Result<cpal::SupportedStreamConfig> {
     let Some(rate) = rate else {
         return Ok(device.default_output_config()?);
     };

@@ -710,7 +710,13 @@ impl EventList {
     }
 
     pub fn push(&mut self, e: HostEvent) {
-        let raw = match e {
+        self.push_at(e, 0);
+    }
+
+    /// Add an event `time` frames into the block. Events must be added in
+    /// time order.
+    pub fn push_at(&mut self, e: HostEvent, time: u32) {
+        let mut raw = match e {
             HostEvent::Param(c) => RawEvent::Param(clap_event_param_value {
                 header: header::<clap_event_param_value>(CLAP_EVENT_PARAM_VALUE),
                 param_id: c.id,
@@ -746,6 +752,11 @@ impl EventList {
                 }),
             },
         };
+        match &mut raw {
+            RawEvent::Param(e) => e.header.time = time,
+            RawEvent::Note(e) => e.header.time = time,
+            RawEvent::Midi(e) => e.header.time = time,
+        }
         self.events.push(raw);
     }
 
