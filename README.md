@@ -1,6 +1,6 @@
 # lextrack
 
-A terminal tracker modelled on the [Dirtywave M8](https://dirtywave.com), with [CLAP](https://cleveraudio.org) plugins in place of the M8's built-in synths. It opens M8 song files (`.m8s`), shows them on an M8-style screen, and lets you play and edit them with the M8's eight buttons.
+A terminal tracker modelled on the [Dirtywave M8](https://dirtywave.com), with an M8-style sampler built in and [CLAP](https://cleveraudio.org) plugins in place of the M8's other synths. It opens M8 song files (`.m8s`), shows them on an M8-style screen, and lets you play and edit them with the M8's eight buttons.
 
 ```
 SONG                             ███████
@@ -101,7 +101,8 @@ LSCPIT       L  live          S  song          C  chain    P  phrase
 - **SONG**: eight tracks of chain numbers, 256 rows. SHIFT+RIGHT opens the chain under the cursor.
 - **CHAIN**: up to 16 phrases (PH) with a transpose each (TSP). SHIFT+RIGHT opens the phrase.
 - **PHRASE**: 16 steps of note (N), volume (V), instrument (I) and three effects. SHIFT+RIGHT opens the step's instrument; SHIFT+UP opens the groove.
-- **INSTRUMENT**: the M8 type, name, transpose setting and table tick, and the CLAP plugin that plays it. Every instrument can use any installed plugin: EDIT on PLUGIN opens the list of installed plugins (the standard CLAP folders, `$CLAP_PATH`, and any plugin named on the command line or in the map), EDIT+LEFT/RIGHT steps through them, and EDIT+OPTION goes back to the shared default. `(DEF)` after a plugin name means the instrument uses the shared default. Below are the plugin's parameters, changed with EDIT+arrows and reset with EDIT+OPTION. SHIFT+RIGHT opens the instrument's table.
+- **INSTRUMENT**: the M8 type, name, transpose setting and table tick, and what plays it: the built-in sampler for SAMPLER instruments (see below), a CLAP plugin for the rest. Every instrument can use any installed plugin: EDIT on PLUGIN opens the list of installed plugins (the standard CLAP folders, `$CLAP_PATH`, and any plugin named on the command line or in the map), EDIT+LEFT/RIGHT steps through them, and EDIT+OPTION goes back to the shared default. `(DEF)` after a plugin name means the instrument uses the shared default. Below are the plugin's parameters, changed with EDIT+arrows and reset with EDIT+OPTION. SHIFT+RIGHT opens the instrument's table.
+- **INSTRUMENT, SAMPLER**: SAMPLE is the WAV file. EDIT on it opens a file browser that plays each file as the cursor reaches it (PLAY plays it again, EDIT picks it, OPTION goes back); EDIT+LEFT/RIGHT steps to the previous or next file in the same folder; EDIT+OPTION clears it. Below it, the waveform with the start (S), loop (L) and end (E) points, or the slices, and the M8 sampler's settings: VOLUME, PITCH, FINE TUNE, PLAY mode, SLICE, START, LOOP ST, LENGTH, DEGRADE, FILTER, CUTOFF, RES, AMP, LIMIT, PAN, DRY, CHORUS, DELAY, REVERB, and two envelopes and two LFOs (destination, amount, attack / hold / decay, or shape / trigger / frequency). EDIT+arrows change them, EDIT+OPTION resets one.
 - **TABLE**: 16 steps of transpose, volume and three effects (edited and saved, but not played yet).
 - **GROOVE**: the ticks per step, with the total per phrase (96 is straight time).
 - **PROJECT**: tempo, transpose, name, SAVE / LOAD / NEW (press EDIT twice to drop unsaved changes), RENDER to a WAV file, and the audio output: device, sample rate and buffer size. APPLY restarts audio with them and saves them for next time.
@@ -121,7 +122,21 @@ fmsynth = ~/.clap/Dexed.clap            # every FM synth instrument
 default = ~/.clap/Surge XT.clap         # everything else
 ```
 
-Kinds are `wavsynth`, `macrosynth`, `sampler`, `midiout` and `fmsynth`.
+Kinds are `wavsynth`, `macrosynth`, `sampler`, `midiout` and `fmsynth`. SAMPLER instruments play their sample on the built-in sampler, and `default` doesn't apply to them; a rule by number or a `sampler = ...` rule hands them to a plugin instead.
+
+## The sampler
+
+SAMPLER instruments play WAV files (8, 16, 24 or 32-bit, or float; mono or stereo) the way the M8's sampler does, one note per track:
+
+- **Sample paths** are stored in the song as the M8 stores them, from the SD card root: `/Samples/drums/kick.wav`. The card root is the folder above the song's folder (`Songs/`), so a copy of an M8 card plays as it is. Samples outside the card root are stored with their full path.
+- **Pitch.** C-4 plays the sample at its own pitch; PITCH adds semitones and FINE TUNE (80 is centre) up to a semitone either way.
+- **PLAY**: FWD, REV, FWDLOOP, REVLOOP, FWD PP and REV PP (ping-pong between the loop point and the end), and OSC, OSC REV and OSC PP, which play the loop as one cycle of an oscillator at the note's pitch.
+- **START, LOOP ST, LENGTH** are fractions of the sample: START where playing begins, LENGTH how much of the rest plays (FF to the end), LOOP ST where the loop begins, between the two.
+- **SLICE**: at 00 the whole sample plays. Otherwise each note plays one slice, C-1 the first, at the sample's own pitch: the slices are the WAV file's cue markers when it has any, or that many equal parts.
+- **DEGRADE** lowers the sample rate and bit depth. **FILTER** is low, high or band pass or band stop, with CUTOFF and RES. **AMP** drives the sound into the **LIMIT**er: CLIP, SIN, FOLD, WRAP, or POST (clipped after the volume). **VOLUME** is attenuation: 00 is full volume, FF silent. **PAN** 80 is centre.
+- **Envelopes** (attack, hold, decay) and **LFOs** (20 shapes; FREE, RETRIG, HOLD or ONCE) modulate VOLUME, PITCH, LOOP ST, LENGTH, DEGRADE, CUTOFF, RES, AMP or PAN by their amount.
+- **Sampler effects** in phrases set a setting for the note on that step: `VOL PIT FIN PLY STA LOP LEN DEG FLT CUT RES AMP LIM PAN`, envelope and LFO amounts and times (`EA1 AT1 HO1 DE1 EA2`... `LA1 LF1 LT1`...) and `SLI`. On a step without a note they change the note already playing. EDIT+UP past the last sequencer effect reaches them.
+- DRY, CHORUS, DELAY and REVERB are kept in the song but not played yet: there are no send effects. The M8's exact envelope times, LFO rates and filter curves aren't documented, so these are close, not exact.
 
 ## How songs are played
 
@@ -131,12 +146,13 @@ Kinds are `wavsynth`, `macrosynth`, `sampler`, `midiout` and `fmsynth`.
 - M8 note C-4 is MIDI note 60 (C-1 is 24). `--note-offset` changes this.
 - The volume column becomes note velocity: `00`-`7F` maps to 0-1, higher values play at full velocity, and an empty volume plays at full velocity.
 - Chain transpose applies to instruments whose TRANSP setting is on.
-- Effects: `DEL` (delay the note), `GRV` (change groove), `HOP` (jump to a phrase step), `KIL` (cut the note) and `TPO` (tempo). Other effects are ignored for now.
+- Effects: `DEL` (delay the note), `GRV` (change groove), `HOP` (jump to a phrase step), `KIL` (cut the note) and `TPO` (tempo), and the sampler's instrument effects (see above). Other effects are ignored for now.
 
 ## Not supported yet
 
 - Instrument tables, the remaining effects, the M8 mixer and send effects, live mode and instrument modulators.
-- Mapping M8 instrument parameters (filters, envelopes...) to plugin parameters. Each instrument plays its plugin's own settings.
+- Mapping M8 instrument parameters (filters, envelopes...) to plugin parameters. Each plugin instrument plays its plugin's own settings.
+- The sampler's DRY, CHORUS, DELAY and REVERB sends, its waveform's play position, and recording or editing samples.
 - Plugin GUI windows: plugins are controlled from the instrument view only.
 - Songs from M8 firmware 2.x are supported; m8-js documents the file format up to firmware 2.7, so songs saved by firmware 3 or later have not been tested.
 
@@ -148,6 +164,7 @@ The song reader and writer are a Rust port of [m8-js](https://github.com/whitloc
 - `src/m8/sequencer.rs` turns song rows, chains and phrases into note events tick by tick, and handles chain and phrase looping, mutes and solos.
 - `src/m8/rack.rs` runs one plugin per instrument, mixes them, and plays them through the sound card (via cpal) or renders them to a WAV file. Notes reach the plugins on the exact sample.
 - `src/m8/instruments.rs` reads and writes instrument maps and plugin states.
+- `src/m8/sampler.rs` is the built-in sampler: WAV loading, finding sample files, and the voices.
 - `src/m8/screen.rs` is the 40x24 character screen in the M8's default colours; `src/m8/input.rs` turns keys into M8 button presses; `src/m8/ui.rs` holds the views; `src/m8/app.rs` is the command line.
 - `src/plugin.rs` loads `.clap` files and implements the host side of the CLAP API (`clap.params`, `clap.state`, `clap.log`, `clap.thread-check`, `clap.audio-ports`).
 - `src/audio.rs`, `src/settings.rs` and `src/discovery.rs` find sound cards, save audio settings and find plugins.

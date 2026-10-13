@@ -175,6 +175,96 @@ pub struct Instrument {
     pub fine_tune: u8,
     /// Sampler only.
     pub sample_path: String,
+    /// Sampler only: the parameters after FINE TUNE.
+    pub sampler: SamplerParams,
+}
+
+/// Number of sampler parameter bytes after FINE TUNE: play mode, slice,
+/// start, loop start, length, degrade, filter (3), amp (2), mixer (5), two
+/// envelopes and two LFOs (6 each).
+pub const SAMPLER_PARAMS: usize = 40;
+
+/// A sampler instrument's parameters, as the bytes the file stores. The
+/// `S_*` constants index them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SamplerParams(pub [u8; SAMPLER_PARAMS]);
+
+pub const S_PLAY: usize = 0;
+pub const S_SLICE: usize = 1;
+pub const S_START: usize = 2;
+pub const S_LOOP: usize = 3;
+pub const S_LENGTH: usize = 4;
+pub const S_DEGRADE: usize = 5;
+pub const S_FILTER: usize = 6;
+pub const S_CUTOFF: usize = 7;
+pub const S_RES: usize = 8;
+pub const S_AMP: usize = 9;
+pub const S_LIMIT: usize = 10;
+pub const S_PAN: usize = 11;
+pub const S_DRY: usize = 12;
+pub const S_CHORUS: usize = 13;
+pub const S_DELAY: usize = 14;
+pub const S_REVERB: usize = 15;
+/// Envelope `i` starts at `S_ENV + 6 * i`: destination, amount, attack,
+/// hold, decay, retrigger.
+pub const S_ENV: usize = 16;
+/// LFO `i` starts at `S_LFO + 6 * i`: shape, destination, trigger mode,
+/// frequency, amount, retrigger.
+pub const S_LFO: usize = 28;
+
+impl Default for SamplerParams {
+    /// A new sampler's settings (m8-js's defaults).
+    fn default() -> Self {
+        let mut b = [0u8; SAMPLER_PARAMS];
+        b[S_LENGTH] = 0xFF;
+        b[S_CUTOFF] = 0xFF;
+        b[S_PAN] = 0x80;
+        b[S_DRY] = 0xC0;
+        for i in 0..2 {
+            let e = S_ENV + 6 * i;
+            b[e + 1] = 0xFF; // amount
+            b[e + 4] = 0x80; // decay
+            let l = S_LFO + 6 * i;
+            b[l + 3] = 0x10; // frequency
+            b[l + 4] = 0xFF; // amount
+        }
+        SamplerParams(b)
+    }
+}
+
+impl Instrument {
+    /// A sampler setting by number: volume, pitch, fine tune, then the
+    /// [`SamplerParams`] bytes. This is also the order of the sampler's
+    /// effect commands.
+    pub fn sampler_param(&self, i: usize) -> u8 {
+        match i {
+            0 => self.volume,
+            1 => self.pitch,
+            2 => self.fine_tune,
+            _ => self.sampler.0[i - 3],
+        }
+    }
+
+    /// Change the instrument's type. An empty instrument (whose settings
+    /// are all 0xFF in the file) gets a new instrument's settings.
+    pub fn set_kind(&mut self, kind: InstrumentKind) {
+        if self.kind == InstrumentKind::None && kind != InstrumentKind::None {
+            self.volume = 0;
+            self.pitch = 0;
+            self.fine_tune = 0x80;
+            self.sampler = SamplerParams::default();
+        }
+        self.kind = kind;
+    }
+
+    pub fn set_sampler_param(&mut self, i: usize, v: u8) {
+        match i {
+            0 => self.volume = v,
+            1 => self.pitch = v,
+            2 => self.fine_tune = v,
+            _ => self.sampler.0[i - 3] = v,
+        }
+    }
 }
 
 /// A song file. Not every field is used for playback yet.
@@ -336,6 +426,15 @@ impl Song {
             put_str(&mut b[o + 1..o + 13], &inst.name, pad);
             b[o + 13] = inst.transpose as u8;
             b[o + 14] = inst.table_tick;
+            if !matches!(inst.kind, InstrumentKind::MidiOut | InstrumentKind::None) {
+                b[o + 15] = inst.volume;
+                b[o + 16] = inst.pitch;
+                b[o + 17] = inst.fine_tune;
+            }
+            if inst.kind == InstrumentKind::Sampler {
+                b[o + 18..o + 18 + SAMPLER_PARAMS].copy_from_slice(&inst.sampler.0);
+                put_str(&mut b[o + 0x57..o + 0x57 + 127], &inst.sample_path, 0x00);
+            }
         }
         b
     }
@@ -535,9 +634,14 @@ fn read_instrument(r: &mut Reader) -> Result<Instrument> {
     } else {
         (r.u8()?, r.u8()?, r.u8()?)
     };
+    let sampler = if kind == InstrumentKind::Sampler {
+        SamplerParams(r.take(SAMPLER_PARAMS)?.try_into().unwrap())
+    } else {
+        SamplerParams::default()
+    };
     r.seek(start + 0x57)?;
     let sample_path = if kind == InstrumentKind::Sampler {
-        r.str(128)?
+        r.str(127)?
     } else {
         String::new()
     };
@@ -550,6 +654,7 @@ fn read_instrument(r: &mut Reader) -> Result<Instrument> {
         pitch,
         fine_tune,
         sample_path,
+        sampler,
     })
 }
 
@@ -579,10 +684,31 @@ pub const SEQ_FX: [&str; 0x17] = [
     "PVX", "SCA", "SCG", "SED", "SNG", "TBL", "THO", "TIC", "TPO", "TSP",
 ];
 
+/// Sampler effect names, from command 0x80 (firmware 2.6, after m8-js).
+pub const SAMPLER_FX: [&str; 0x23] = [
+    "VOL", "PIT", "FIN", "PLY", "STA", "LOP", "LEN", "DEG", "FLT", "CUT", "RES", "AMP", "LIM",
+    "PAN", "DRY", "SCH", "SDL", "SRV", "EA1", "AT1", "HO1", "DE1", "ET1", "EA2", "AT2", "HO2",
+    "DE2", "ET2", "LA1", "LF1", "LT1", "LA2", "LF2", "LT2", "SLI",
+];
+
+/// The first instrument effect command.
+pub const INSTRUMENT_FX: u8 = 0x80;
+
+/// Every effect command the phrase and table views offer, in order.
+pub fn fx_commands() -> impl Iterator<Item = u8> {
+    (0..SEQ_FX.len() as u8).chain(INSTRUMENT_FX..INSTRUMENT_FX + SAMPLER_FX.len() as u8)
+}
+
 pub fn fx_name(command: u8) -> String {
-    match SEQ_FX.get(command as usize) {
+    if command == EMPTY {
+        return "---".into();
+    }
+    let name = match command.checked_sub(INSTRUMENT_FX) {
+        Some(i) => SAMPLER_FX.get(i as usize),
+        None => SEQ_FX.get(command as usize),
+    };
+    match name {
         Some(n) => (*n).into(),
-        None if command == EMPTY => "---".into(),
         None => format!("x{command:02X}"),
     }
 }
@@ -700,6 +826,24 @@ mod tests {
         assert_eq!(back.grooves[2], s.grooves[2]);
         assert_eq!(back.instruments[4].kind, InstrumentKind::FmSynth);
         assert_eq!(back.instruments[4].name, "KEYS");
+    }
+
+    #[test]
+    fn sampler_settings_survive_saving() {
+        let s = fixture("TESTING.m8s");
+        let sam = &s.instruments[4];
+        assert_eq!(sam.sampler, SamplerParams::default());
+        let mut s = Song::new_empty();
+        let inst = &mut s.instruments[7];
+        inst.set_kind(InstrumentKind::Sampler);
+        assert_eq!((inst.volume, inst.pitch, inst.fine_tune), (0, 0, 0x80));
+        inst.sample_path = "/Samples/drums/kick.wav".into();
+        inst.set_sampler_param(3 + S_START, 0x40);
+        inst.set_sampler_param(1, 0xF4);
+        inst.sampler.0[S_LFO + 7] = 0x22;
+        let back = Song::parse(&s.to_bytes()).unwrap();
+        assert_eq!(back.instruments[7], s.instruments[7]);
+        assert_eq!(back.instruments[7].sampler_param(3 + S_START), 0x40);
     }
 
     #[test]

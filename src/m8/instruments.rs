@@ -184,6 +184,15 @@ impl InstrumentMap {
         self.by_number.is_empty() && self.by_kind.is_empty() && self.default.is_none()
     }
 
+    /// Whether the built-in sampler plays this instrument: a SAMPLER with no
+    /// plugin chosen by number or by a `sampler` rule. `default` doesn't
+    /// apply to samplers.
+    pub fn builtin_sampler(&self, number: u8, instrument: &Instrument) -> bool {
+        instrument.kind == InstrumentKind::Sampler
+            && !self.by_number.contains_key(&number)
+            && !self.by_kind.contains_key("sampler")
+    }
+
     pub fn resolve(&self, number: u8, instrument: &Instrument) -> Option<&PluginRef> {
         if let Some(p) = self.by_number.get(&number) {
             return Some(p);
@@ -249,6 +258,7 @@ mod tests {
             pitch: 0,
             fine_tune: 0x80,
             sample_path: String::new(),
+            sampler: Default::default(),
         }
     }
 

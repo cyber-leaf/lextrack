@@ -12,6 +12,7 @@ use ratatui::Terminal;
 use super::format::{Song, EMPTY, SONG_ROWS, TRACKS};
 use super::instruments::{InstrumentMap, PluginRef};
 use super::rack::{load_slots, render_wav};
+use super::sampler::{SampleBank, SamplerSet};
 use super::ui::{App, Options};
 use crate::settings::{self, AudioSettings};
 use crate::{audio, discovery};
@@ -22,7 +23,8 @@ lextrack: an M8-style tracker that plays CLAP plugins
 USAGE:
     lextrack [SONG.m8s] [OPTIONS]
 
-Opens a Dirtywave M8 song (or a new one) in an M8-style tracker. Each M8
+Opens a Dirtywave M8 song (or a new one) in an M8-style tracker. SAMPLER
+instruments play their WAV files on the built-in sampler; every other M8
 instrument is played by a CLAP plugin instance: pick plugins in the
 instrument view, or with the options below. Plugin choices and settings are
 saved next to the song in SONG.lextrack.
@@ -175,6 +177,15 @@ pub fn sidecar(song: &Path) -> PathBuf {
     song.with_extension("lextrack")
 }
 
+/// The folder a song file is in (the current folder for a new song).
+pub fn song_dir(song: Option<&Path>) -> PathBuf {
+    let dir = song
+        .and_then(|p| p.parent())
+        .filter(|d| !d.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), |d| d.to_path_buf());
+    dir.canonicalize().unwrap_or(dir)
+}
+
 /// A song and the instrument map saved next to it, if any.
 pub fn load_song_and_map(path: &Path) -> Result<(Song, InstrumentMap)> {
     let song = Song::load(path)?;
@@ -216,21 +227,25 @@ pub fn run(args: impl Iterator<Item = OsString>) -> Result<()> {
         map.set(k, v, cwd)?;
     }
 
+    let song_dir = song_dir(o.song.as_deref());
     if o.info {
-        print_info(&song, &map);
+        print_info(&song, &map, &song_dir);
         return Ok(());
     }
 
     if let Some(out) = &o.render {
-        if map.is_empty() {
+        let (samplers, sample_problems) =
+            SamplerSet::build(&song, &song_dir, &map, &mut SampleBank::default());
+        let sampled = samplers.samples.iter().filter(|s| s.is_some()).count();
+        if map.is_empty() && sampled == 0 {
             bail!("no plugins chosen. Use --plugin PATH.clap for every instrument, or --map FILE");
         }
         let (mut slots, missing) = load_slots(&song, &map);
-        for (n, why) in &missing {
+        for (n, why) in missing.iter().chain(&sample_problems) {
             eprintln!("instrument {n:02X} will be silent: {why}");
         }
-        if slots.is_empty() {
-            bail!("none of the song's instruments has a working plugin");
+        if slots.is_empty() && sampled == 0 {
+            bail!("none of the song's instruments has a working plugin or sample");
         }
         for s in &slots {
             if let Some(state) = map.states.get(&s.instrument) {
@@ -241,6 +256,7 @@ pub fn run(args: impl Iterator<Item = OsString>) -> Result<()> {
         render_wav(
             Arc::new(song.clone()),
             &mut slots,
+            Arc::new(samplers),
             o.row,
             o.seconds,
             rate,
@@ -248,7 +264,7 @@ pub fn run(args: impl Iterator<Item = OsString>) -> Result<()> {
             out,
         )?;
         eprintln!(
-            "rendered {:.1} s of \"{}\" with {} plugin(s) to {}",
+            "rendered {:.1} s of \"{}\" with {} plugin(s) and {sampled} sample(s) to {}",
             o.seconds,
             song.name,
             slots.len(),
@@ -343,7 +359,7 @@ fn list_plugins() {
     }
 }
 
-fn print_info(song: &Song, map: &InstrumentMap) {
+fn print_info(song: &Song, map: &InstrumentMap, song_dir: &Path) {
     println!(
         "{} (M8 firmware {}), {} BPM",
         if song.name.is_empty() {
@@ -377,11 +393,19 @@ fn print_info(song: &Song, map: &InstrumentMap) {
     if used.is_empty() {
         println!("no instrument plays a note");
     }
+    let root = super::sampler::card_root(song_dir, &song.directory);
     for n in used {
         let inst = &song.instruments[n as usize];
-        let plugin = map
-            .resolve(n, inst)
-            .map_or("(no plugin)".to_string(), |p| p.path.display().to_string());
+        let plugin = if map.builtin_sampler(n, inst) {
+            match super::sampler::resolve_sample_path(&root, song_dir, &inst.sample_path) {
+                Some(p) => format!("sample {}", p.display()),
+                None if inst.sample_path.is_empty() => "(no sample)".into(),
+                None => format!("sample {} (not found)", inst.sample_path),
+            }
+        } else {
+            map.resolve(n, inst)
+                .map_or("(no plugin)".to_string(), |p| p.path.display().to_string())
+        };
         println!(
             "instrument {n:02X} {:<12} {:<10} -> {plugin}",
             inst.name,
