@@ -1,0 +1,22 @@
+[package]
+name = "lextrack"
+version = "0.1.0"
+edition = "2021"
+description = "A terminal host for CLAP audio plugins"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap-sys = "0.5"
+cpal = "0.18"
+libloading = "0.9"
+ratatui = "0.30"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[workspace]
+members = ["test-plugin"]
+
+[profile.release]
+debug = 1

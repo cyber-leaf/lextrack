@@ -1,0 +1,11 @@
+[package]
+name = "lextrack-test-plugin"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+clap-sys = "0.5"
