@@ -47,10 +47,23 @@ pub struct Pos {
     pub phrase_step: usize,
 }
 
+/// What a track repeats.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Looping {
+    /// Follow the song rows (blocks loop on their own).
+    #[default]
+    Song,
+    /// Repeat the current chain.
+    Chain,
+    /// Repeat the current phrase.
+    Phrase,
+}
+
 #[derive(Clone, Copy, Default)]
 struct Track {
     /// `None` when the track is stopped.
     pos: Option<Pos>,
+    looping: Looping,
     /// Tick within the current step, and the step's length.
     tick: u32,
     len: u32,
@@ -69,6 +82,9 @@ pub struct Sequencer {
     song: Arc<Song>,
     tracks: [Track; TRACKS],
     tempo: f64,
+    /// Bit per track.
+    muted: u8,
+    soloed: u8,
 }
 
 /// Samples between two ticks at `tempo` BPM.
@@ -83,7 +99,59 @@ impl Sequencer {
             song,
             tracks: [Track::default(); TRACKS],
             tempo,
+            muted: 0,
+            soloed: 0,
         }
+    }
+
+    /// Swap in an edited song. Tracks carry on from where they are.
+    pub fn set_song(&mut self, song: Arc<Song>) {
+        self.song = song;
+    }
+
+    /// Silence tracks: bit `t` of `muted` mutes track `t`; when any bit of
+    /// `soloed` is set, only those tracks play.
+    pub fn set_mutes(&mut self, muted: u8, soloed: u8) {
+        self.muted = muted;
+        self.soloed = soloed;
+    }
+
+    fn audible(&self, t: usize) -> bool {
+        let bit = 1 << t;
+        self.muted & bit == 0 && (self.soloed == 0 || self.soloed & bit != 0)
+    }
+
+    /// Loop one chain on one track; other tracks stop.
+    pub fn play_chain(&mut self, track: usize, row: usize, out: &mut Vec<SeqEvent>) {
+        self.stop(out);
+        self.tempo = self.song.tempo as f64;
+        let chain = self.song.rows[row.min(SONG_ROWS - 1)][track] as usize;
+        if chain >= CHAINS {
+            return;
+        }
+        self.tracks[track] = Track {
+            pos: self.find_in_chain(row, chain, 0),
+            looping: Looping::Chain,
+            ..Track::default()
+        };
+    }
+
+    /// Loop one phrase on one track; other tracks stop. `pos` gives the
+    /// chain context (for transpose) and the phrase.
+    pub fn play_phrase(&mut self, track: usize, pos: Pos, out: &mut Vec<SeqEvent>) {
+        self.stop(out);
+        self.tempo = self.song.tempo as f64;
+        if pos.phrase >= PHRASES {
+            return;
+        }
+        self.tracks[track] = Track {
+            pos: Some(Pos {
+                phrase_step: 0,
+                ..pos
+            }),
+            looping: Looping::Phrase,
+            ..Track::default()
+        };
     }
 
     pub fn tempo(&self) -> f64 {
@@ -135,7 +203,10 @@ impl Sequencer {
             }
             let tr = self.tracks[t];
             if let Some((at, inst, note, velocity)) = tr.trigger {
-                if at == tr.tick {
+                if at == tr.tick && !self.audible(t) {
+                    self.release(t, out);
+                    self.tracks[t].trigger = None;
+                } else if at == tr.tick {
                     self.release(t, out);
                     out.push(SeqEvent::NoteOn {
                         track: t as u8,
@@ -238,7 +309,30 @@ impl Sequencer {
             tr.pos = Some(pos);
             return;
         }
-        self.tracks[t].pos = self.find(t, pos.row, pos.chain_step + 1);
+        self.tracks[t].pos = match self.tracks[t].looping {
+            Looping::Song => self.find(t, pos.row, pos.chain_step + 1),
+            Looping::Phrase => Some(Pos {
+                phrase_step: 0,
+                ..pos
+            }),
+            Looping::Chain => self
+                .find_in_chain(pos.row, pos.chain, pos.chain_step + 1)
+                .or_else(|| self.find_in_chain(pos.row, pos.chain, 0)),
+        };
+    }
+
+    /// The first step with a phrase in `chain`, at or after `from`.
+    fn find_in_chain(&self, row: usize, chain: usize, from: usize) -> Option<Pos> {
+        (from..STEPS).find_map(|cs| {
+            let phrase = self.song.chains[chain].steps[cs].phrase as usize;
+            (phrase < PHRASES).then_some(Pos {
+                row,
+                chain,
+                chain_step: cs,
+                phrase,
+                phrase_step: 0,
+            })
+        })
     }
 
     /// The first playable chain step at or after `row`/`chain_step`,
@@ -424,6 +518,70 @@ mod tests {
         }
         assert_eq!(starts, [0, 7, 12, 19]);
         assert_eq!(seq.tempo(), 140.0);
+    }
+
+    #[test]
+    fn loops_a_chain_or_a_phrase() {
+        let mut s = blank();
+        s.rows[0][2] = 0;
+        s.rows[1][2] = 1;
+        s.chains[0].steps[0].phrase = 0;
+        s.chains[0].steps[1].phrase = 1;
+        set_note(&mut s, 0, 0, 36, 0);
+        set_note(&mut s, 1, 0, 38, 0);
+        let song = Arc::new(s);
+        let mut seq = Sequencer::new(song.clone());
+        let mut out = Vec::new();
+        seq.play_chain(2, 0, &mut out);
+        let mut notes = Vec::new();
+        for _ in 0..96 * 4 {
+            seq.tick(&mut out);
+            for e in out.drain(..) {
+                if let SeqEvent::NoteOn { note, .. } = e {
+                    notes.push(note);
+                }
+            }
+        }
+        assert_eq!(notes, [36, 38, 36, 38]);
+        let pos = Pos {
+            row: 0,
+            chain: 0,
+            chain_step: 1,
+            phrase: 1,
+            phrase_step: 5,
+        };
+        seq.play_phrase(2, pos, &mut out);
+        notes.clear();
+        for _ in 0..96 * 3 {
+            seq.tick(&mut out);
+            for e in out.drain(..) {
+                if let SeqEvent::NoteOn { note, .. } = e {
+                    notes.push(note);
+                }
+            }
+        }
+        assert_eq!(notes, [38, 38, 38]);
+    }
+
+    #[test]
+    fn muted_tracks_stay_silent() {
+        let mut s = blank();
+        s.rows[0][0] = 0;
+        s.rows[0][1] = 0;
+        s.chains[0].steps[0].phrase = 0;
+        set_note(&mut s, 0, 0, 36, 0);
+        let mut seq = Sequencer::new(Arc::new(s));
+        let mut out = Vec::new();
+        seq.set_mutes(0b01, 0);
+        seq.play_from(0, &mut out);
+        seq.tick(&mut out);
+        assert!(matches!(out[..], [SeqEvent::NoteOn { track: 1, .. }]));
+        out.clear();
+        seq.set_mutes(0, 0b01);
+        seq.play_from(0, &mut out);
+        out.clear();
+        seq.tick(&mut out);
+        assert!(matches!(out[..], [SeqEvent::NoteOn { track: 0, .. }]));
     }
 
     #[test]

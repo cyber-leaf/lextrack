@@ -3,6 +3,9 @@
 
 pub mod app;
 pub mod format;
+pub mod input;
 pub mod instruments;
 pub mod rack;
+pub mod screen;
 pub mod sequencer;
+pub mod ui;

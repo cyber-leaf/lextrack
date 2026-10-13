@@ -1,5 +1,5 @@
 # Instrument map for demo.m8s: which CLAP plugin plays each M8 instrument.
-#   lextrack m8 examples/demo.m8s --map examples/demo.map
+#   lextrack examples/demo.m8s --map examples/demo.map
 #
 # Keys: an instrument number in hex (00-7F), an M8 instrument kind
 # (wavsynth, macrosynth, sampler, midiout, fmsynth), or "default".

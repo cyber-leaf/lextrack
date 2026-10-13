@@ -26,6 +26,7 @@ use clap_sys::factory::plugin_factory::*;
 use clap_sys::host::clap_host;
 use clap_sys::id::clap_id;
 use clap_sys::plugin::{clap_plugin, clap_plugin_descriptor};
+use clap_sys::stream::{clap_istream, clap_ostream};
 use clap_sys::version::{clap_version_is_compatible, CLAP_VERSION};
 
 // ---------------------------------------------------------------------------
@@ -51,9 +52,11 @@ pub struct PluginDescriptor {
     pub id: String,
     pub name: String,
     pub vendor: String,
+    #[allow(dead_code)]
     pub version: String,
     #[allow(dead_code)]
     pub description: String,
+    #[allow(dead_code)]
     pub features: Vec<String>,
 }
 
@@ -361,6 +364,7 @@ pub struct ParamInfo {
     pub flags: u32,
     pub cookie: *mut c_void,
     pub name: String,
+    #[allow(dead_code)]
     pub module: String,
     pub min: f64,
     pub max: f64,
@@ -376,12 +380,6 @@ impl ParamInfo {
     }
     pub fn is_readonly(&self) -> bool {
         self.flags & CLAP_PARAM_IS_READONLY != 0
-    }
-    pub fn is_periodic(&self) -> bool {
-        self.flags & CLAP_PARAM_IS_PERIODIC != 0
-    }
-    pub fn is_bypass(&self) -> bool {
-        self.flags & CLAP_PARAM_IS_BYPASS != 0
     }
 }
 
@@ -491,10 +489,6 @@ impl PluginInstance {
 
     pub fn raw(&self) -> RawPlugin {
         RawPlugin(self.plugin)
-    }
-
-    pub fn has_params(&self) -> bool {
-        !self.params.is_null()
     }
 
     // --- activation --------------------------------------------------------
@@ -622,12 +616,30 @@ impl PluginInstance {
         unsafe { f(self.plugin, id, value, buf.as_mut_ptr(), buf.len() as u32) }.then(|| cbuf(&buf))
     }
 
-    pub fn text_to_value(&self, id: clap_id, text: &str) -> Option<f64> {
-        let p = unsafe { self.params.as_ref()? };
-        let f = p.text_to_value?;
-        let c = CString::new(text).ok()?;
-        let mut v = 0.0;
-        unsafe { f(self.plugin, id, c.as_ptr(), &mut v) }.then_some(v)
+    /// The plugin's saved state (`clap.state`), if it supports saving.
+    pub fn save_state(&self) -> Option<Vec<u8>> {
+        let ext = self.extension(CLAP_EXT_STATE) as *const clap_plugin_state;
+        let save = unsafe { ext.as_ref()?.save? };
+        let mut buf: Vec<u8> = Vec::new();
+        let stream = clap_ostream {
+            ctx: &mut buf as *mut Vec<u8> as *mut c_void,
+            write: Some(ostream_write),
+        };
+        unsafe { save(self.plugin, &stream) }.then_some(buf)
+    }
+
+    /// Restore state from [`save_state`](Self::save_state).
+    pub fn load_state(&self, data: &[u8]) -> bool {
+        let ext = self.extension(CLAP_EXT_STATE) as *const clap_plugin_state;
+        let Some(load) = (unsafe { ext.as_ref() }).and_then(|e| e.load) else {
+            return false;
+        };
+        let mut cursor: &[u8] = data;
+        let stream = clap_istream {
+            ctx: &mut cursor as *mut &[u8] as *mut c_void,
+            read: Some(istream_read),
+        };
+        unsafe { load(self.plugin, &stream) }
     }
 
     /// Push parameter changes while the plugin is *not* active. While active,
@@ -800,4 +812,29 @@ unsafe extern "C" fn discard_push(
     _: *const clap_event_header,
 ) -> bool {
     true
+}
+
+unsafe extern "C" fn ostream_write(
+    stream: *const clap_ostream,
+    buffer: *const c_void,
+    size: u64,
+) -> i64 {
+    let buf = &mut *((*stream).ctx as *mut Vec<u8>);
+    buf.extend_from_slice(std::slice::from_raw_parts(
+        buffer as *const u8,
+        size as usize,
+    ));
+    size as i64
+}
+
+unsafe extern "C" fn istream_read(
+    stream: *const clap_istream,
+    buffer: *mut c_void,
+    size: u64,
+) -> i64 {
+    let cursor = &mut *((*stream).ctx as *mut &[u8]);
+    let n = (size as usize).min(cursor.len());
+    std::ptr::copy_nonoverlapping(cursor.as_ptr(), buffer as *mut u8, n);
+    *cursor = &cursor[n..];
+    n as i64
 }

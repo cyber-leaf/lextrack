@@ -28,6 +28,20 @@ const INSTRUMENT_SIZE: usize = 0x57 + 128;
 
 const FILE_SONG: u8 = 0x00;
 
+// Where things live in a song file (firmware 2.x layout).
+const OFF_TRANSPOSE: usize = 0x8E;
+const OFF_TEMPO: usize = 0x8F;
+const OFF_NAME: usize = 0x94;
+const OFF_GROOVES: usize = 0xEE;
+const OFF_ROWS: usize = 0x2EE;
+const OFF_PHRASES: usize = 0xAEE;
+const OFF_CHAINS: usize = 0x9A5E;
+const OFF_TABLES: usize = 0xBA3E;
+const OFF_INSTRUMENTS: usize = 0x13A3E;
+
+/// An empty song (m8-js's DEFAULT.m8s), the starting point for new songs.
+const EMPTY_SONG: &[u8] = include_bytes!("../../tests/fixtures/DEFAULT.m8s");
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Version {
     pub major: u8,
@@ -45,12 +59,6 @@ impl fmt::Display for Version {
 pub struct Fx {
     pub command: u8,
     pub value: u8,
-}
-
-impl Fx {
-    pub fn is_empty(&self) -> bool {
-        self.command == EMPTY
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +137,18 @@ impl InstrumentKind {
         }
     }
 
+    pub fn to_byte(self) -> u8 {
+        match self {
+            Self::Wavsynth => 0x00,
+            Self::Macrosynth => 0x01,
+            Self::Sampler => 0x02,
+            Self::MidiOut => 0x03,
+            Self::FmSynth => 0x04,
+            Self::Other(n) => n,
+            Self::None => 0xFF,
+        }
+    }
+
     /// The name used in instrument map files.
     pub fn name(&self) -> String {
         match self {
@@ -175,6 +195,9 @@ pub struct Song {
     pub chains: Vec<Chain>,
     pub tables: Vec<Table>,
     pub instruments: Vec<Instrument>,
+    /// The file as read; saving writes the edited parts back over it, so
+    /// everything this reader skips survives a round trip.
+    raw: Vec<u8>,
 }
 
 /// A cursor over the file, after m8-js's `M8FileReader`.
@@ -246,6 +269,77 @@ impl Song {
         Song::parse(&bytes).with_context(|| format!("{} is not a readable M8 song", path.display()))
     }
 
+    /// A new, empty song.
+    pub fn new_empty() -> Song {
+        Song::parse(EMPTY_SONG).expect("the built-in empty song parses")
+    }
+
+    /// Write the song to `path`.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        std::fs::write(path, self.to_bytes())
+            .with_context(|| format!("can't write {}", path.display()))
+    }
+
+    /// The song as file bytes: the original file with the fields this
+    /// program edits written back in place.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut b = self.raw.clone();
+        b[OFF_TRANSPOSE] = self.transpose;
+        b[OFF_TEMPO..OFF_TEMPO + 4].copy_from_slice(&self.tempo.to_le_bytes());
+        put_str(&mut b[OFF_NAME..OFF_NAME + 12], &self.name, 0x00);
+        for (i, g) in self.grooves.iter().enumerate() {
+            let o = OFF_GROOVES + i * STEPS;
+            b[o..o + STEPS].copy_from_slice(&g.steps);
+        }
+        for (i, row) in self.rows.iter().enumerate() {
+            let o = OFF_ROWS + i * TRACKS;
+            b[o..o + TRACKS].copy_from_slice(row);
+        }
+        for (i, p) in self.phrases.iter().enumerate() {
+            for (j, st) in p.steps.iter().enumerate() {
+                let o = OFF_PHRASES + (i * STEPS + j) * 9;
+                b[o] = st.note;
+                b[o + 1] = st.volume;
+                b[o + 2] = st.instrument;
+                for (k, fx) in st.fx.iter().enumerate() {
+                    b[o + 3 + k * 2] = fx.command;
+                    b[o + 4 + k * 2] = fx.value;
+                }
+            }
+        }
+        for (i, c) in self.chains.iter().enumerate() {
+            for (j, st) in c.steps.iter().enumerate() {
+                let o = OFF_CHAINS + (i * STEPS + j) * 2;
+                b[o] = st.phrase;
+                b[o + 1] = st.transpose;
+            }
+        }
+        for (i, t) in self.tables.iter().enumerate() {
+            for (j, st) in t.steps.iter().enumerate() {
+                let o = OFF_TABLES + (i * STEPS + j) * 8;
+                b[o] = st.transpose;
+                b[o + 1] = st.volume;
+                for (k, fx) in st.fx.iter().enumerate() {
+                    b[o + 2 + k * 2] = fx.command;
+                    b[o + 3 + k * 2] = fx.value;
+                }
+            }
+        }
+        for (i, inst) in self.instruments.iter().enumerate() {
+            let o = OFF_INSTRUMENTS + i * INSTRUMENT_SIZE;
+            b[o] = inst.kind.to_byte();
+            let pad = if inst.kind == InstrumentKind::None {
+                0xFF
+            } else {
+                0x00
+            };
+            put_str(&mut b[o + 1..o + 13], &inst.name, pad);
+            b[o + 13] = inst.transpose as u8;
+            b[o + 14] = inst.table_tick;
+        }
+        b
+    }
+
     pub fn parse(bytes: &[u8]) -> Result<Song> {
         let mut r = Reader { bytes, pos: 0 };
 
@@ -280,6 +374,7 @@ impl Song {
         r.skip(2 + 8 + 3 + 2 + 1 + 6 + 3 + 2)?;
         r.skip(5)?;
 
+        debug_assert_eq!(r.pos, OFF_GROOVES);
         let mut grooves = Vec::with_capacity(GROOVES);
         for _ in 0..GROOVES {
             grooves.push(Groove {
@@ -287,11 +382,13 @@ impl Song {
             });
         }
 
+        debug_assert_eq!(r.pos, OFF_ROWS);
         let mut rows = Vec::with_capacity(SONG_ROWS);
         for _ in 0..SONG_ROWS {
             rows.push(r.take(TRACKS)?.try_into().unwrap());
         }
 
+        debug_assert_eq!(r.pos, OFF_PHRASES);
         let mut phrases = Vec::with_capacity(PHRASES);
         for _ in 0..PHRASES {
             let mut steps = [PhraseStep {
@@ -311,6 +408,7 @@ impl Song {
             phrases.push(Phrase { steps });
         }
 
+        debug_assert_eq!(r.pos, OFF_CHAINS);
         let mut chains = Vec::with_capacity(CHAINS);
         for _ in 0..CHAINS {
             let mut steps = [ChainStep {
@@ -324,6 +422,7 @@ impl Song {
             chains.push(Chain { steps });
         }
 
+        debug_assert_eq!(r.pos, OFF_TABLES);
         let mut tables = Vec::with_capacity(TABLES);
         for _ in 0..TABLES {
             let mut steps = [TableStep {
@@ -341,6 +440,7 @@ impl Song {
             tables.push(Table { steps });
         }
 
+        debug_assert_eq!(r.pos, OFF_INSTRUMENTS);
         let mut instruments = Vec::with_capacity(INSTRUMENTS);
         for _ in 0..INSTRUMENTS {
             let start = r.pos;
@@ -362,6 +462,7 @@ impl Song {
             chains,
             tables,
             instruments,
+            raw: bytes.to_vec(),
         })
     }
 
@@ -400,6 +501,24 @@ impl Song {
         (0..INSTRUMENTS as u8)
             .filter(|&i| used[i as usize])
             .collect()
+    }
+}
+
+/// Write a fixed-size string field, ended by a 0x00 and padded with `pad`.
+/// Unchanged text is left alone, so bytes after the end marker survive.
+fn put_str(field: &mut [u8], text: &str, pad: u8) {
+    let end = field
+        .iter()
+        .position(|&c| c == 0x00 || c == 0xFF)
+        .unwrap_or(field.len());
+    if field[..end] == *text.as_bytes() {
+        return;
+    }
+    field.fill(pad);
+    let n = text.len().min(field.len());
+    field[..n].copy_from_slice(&text.as_bytes()[..n]);
+    if n < field.len() {
+        field[n] = 0x00;
     }
 }
 
@@ -547,6 +666,40 @@ mod tests {
         assert_eq!(s.tempo, 120.0);
         assert!(s.rows.iter().all(|r| *r == [EMPTY; 8]));
         assert!(s.used_instruments().is_empty());
+    }
+
+    #[test]
+    fn saving_unchanged_songs_is_byte_identical() {
+        for name in ["TESTING.m8s", "DEFAULT.m8s"] {
+            let s = fixture(name);
+            assert!(s.to_bytes() == s.raw, "{name} changed on save");
+        }
+    }
+
+    #[test]
+    fn edits_survive_saving() {
+        let mut s = Song::new_empty();
+        s.name = "EDITED".into();
+        s.tempo = 133.5;
+        s.rows[3][7] = 0x12;
+        s.phrases[0x12].steps[5].fx[2] = Fx {
+            command: 0x05,
+            value: 0x33,
+        };
+        s.chains[0x12].steps[15].transpose = 0xF4;
+        s.tables[9].steps[1].volume = 0x40;
+        s.grooves[2].steps[0] = 9;
+        s.instruments[4].kind = InstrumentKind::FmSynth;
+        s.instruments[4].name = "KEYS".into();
+        let back = Song::parse(&s.to_bytes()).unwrap();
+        assert_eq!((back.name.as_str(), back.tempo), ("EDITED", 133.5));
+        assert_eq!(back.rows[3][7], 0x12);
+        assert_eq!(back.phrases[0x12], s.phrases[0x12]);
+        assert_eq!(back.chains[0x12], s.chains[0x12]);
+        assert_eq!(back.tables[9], s.tables[9]);
+        assert_eq!(back.grooves[2], s.grooves[2]);
+        assert_eq!(back.instruments[4].kind, InstrumentKind::FmSynth);
+        assert_eq!(back.instruments[4].name, "KEYS");
     }
 
     #[test]

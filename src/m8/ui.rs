@@ -1,0 +1,2469 @@
+//! The tracker screen, modelled on the M8: SONG, CHAIN, PHRASE, INSTRUMENT,
+//! TABLE, GROOVE and PROJECT views on a 40x24 character screen, moved
+//! between with SHIFT+arrows, edited with EDIT/OPTION combos, and played
+//! with PLAY. CLAP plugins take the place of the M8's synth engines, so the
+//! instrument view picks a plugin and shows its parameters.
+
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use clap_sys::ext::params::{CLAP_PARAM_RESCAN_ALL, CLAP_PARAM_RESCAN_INFO};
+use ratatui::backend::Backend;
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use ratatui::Terminal;
+
+use super::format::{
+    fx_name, note_name, InstrumentKind, Song, CHAINS, EMPTY, GROOVES, INSTRUMENTS, PHRASES, SEQ_FX,
+    SONG_ROWS, STEPS, TABLES, TRACKS,
+};
+use super::input::{Button, Input, Keys, Press, RELEASE_EVENTS};
+use super::instruments::{InstrumentMap, PluginRef};
+use super::rack::{load_slots_reusing, render_wav, wanted_instruments, Rack, Slot};
+use super::screen::{Role, Screen, ROWS};
+use super::sequencer::Pos;
+use crate::audio;
+use crate::plugin::{ParamChange, ParamInfo, PluginDescriptor};
+use crate::settings::{self, AudioSettings};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum View {
+    Song,
+    Chain,
+    Phrase,
+    Instrument,
+    Table,
+    Groove,
+    Project,
+}
+
+/// Mini-map cells: (letter, column, row, view). Views without a `View`
+/// exist on the M8 but not here yet, and are drawn dim.
+const MAP: &[(char, usize, usize, Option<View>)] = &[
+    ('P', 1, 0, Some(View::Project)),
+    ('G', 3, 0, Some(View::Groove)),
+    ('M', 4, 0, None),
+    ('L', 0, 1, None),
+    ('S', 1, 1, Some(View::Song)),
+    ('C', 2, 1, Some(View::Chain)),
+    ('P', 3, 1, Some(View::Phrase)),
+    ('I', 4, 1, Some(View::Instrument)),
+    ('T', 5, 1, Some(View::Table)),
+    ('V', 1, 2, None),
+    ('E', 1, 3, None),
+];
+
+/// What a grid column holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Kind {
+    Chain,
+    Phrase,
+    Transpose,
+    Note,
+    Volume,
+    Instrument,
+    FxCmd,
+    FxVal,
+    Ticks,
+}
+
+impl Kind {
+    fn can_be_empty(self) -> bool {
+        !matches!(self, Kind::Transpose | Kind::FxVal)
+    }
+
+    fn max(self) -> u8 {
+        match self {
+            Kind::Chain | Kind::Phrase | Kind::Ticks => 0xFE,
+            Kind::Instrument | Kind::Note | Kind::Volume => 0x7F,
+            Kind::FxCmd => SEQ_FX.len() as u8 - 1,
+            Kind::Transpose | Kind::FxVal => 0xFF,
+        }
+    }
+
+    fn big_step(self) -> i32 {
+        match self {
+            Kind::Note => 12,
+            _ => 16,
+        }
+    }
+
+    fn default(self) -> u8 {
+        match self {
+            Kind::Note => 36,
+            Kind::Volume => 0x64,
+            Kind::Ticks => 6,
+            _ => 0,
+        }
+    }
+}
+
+const SONG_COLS: [Kind; 8] = [Kind::Chain; 8];
+const CHAIN_COLS: [Kind; 2] = [Kind::Phrase, Kind::Transpose];
+const PHRASE_COLS: [Kind; 9] = [
+    Kind::Note,
+    Kind::Volume,
+    Kind::Instrument,
+    Kind::FxCmd,
+    Kind::FxVal,
+    Kind::FxCmd,
+    Kind::FxVal,
+    Kind::FxCmd,
+    Kind::FxVal,
+];
+const TABLE_COLS: [Kind; 8] = [
+    Kind::Transpose,
+    Kind::Volume,
+    Kind::FxCmd,
+    Kind::FxVal,
+    Kind::FxCmd,
+    Kind::FxVal,
+    Kind::FxCmd,
+    Kind::FxVal,
+];
+const GROOVE_COLS: [Kind; 1] = [Kind::Ticks];
+
+/// Screen column and width of each grid column.
+const SONG_GEOM: [(usize, usize); 8] = [
+    (3, 2),
+    (6, 2),
+    (9, 2),
+    (12, 2),
+    (15, 2),
+    (18, 2),
+    (21, 2),
+    (24, 2),
+];
+const CHAIN_GEOM: [(usize, usize); 2] = [(3, 2), (6, 2)];
+const PHRASE_GEOM: [(usize, usize); 9] = [
+    (2, 3),
+    (6, 2),
+    (9, 2),
+    (12, 3),
+    (16, 2),
+    (19, 3),
+    (23, 2),
+    (26, 3),
+    (30, 2),
+];
+const TABLE_GEOM: [(usize, usize); 8] = [
+    (2, 2),
+    (5, 2),
+    (8, 3),
+    (12, 2),
+    (15, 3),
+    (19, 2),
+    (22, 3),
+    (26, 2),
+];
+const GROOVE_GEOM: [(usize, usize); 1] = [(2, 2)];
+
+/// Top screen row of grid data.
+const GRID_Y: usize = 3;
+const VISIBLE: usize = 16;
+/// Left edge of the right-hand panel.
+const PANEL_X: usize = 33;
+
+const DOUBLE_TAP: Duration = Duration::from_millis(400);
+
+#[derive(Clone, Copy, Default)]
+struct Cursor {
+    row: usize,
+    col: usize,
+}
+
+/// Where in the song a chain or phrase view came from.
+#[derive(Clone, Copy, Debug)]
+struct Ctx {
+    track: usize,
+    row: usize,
+    chain_step: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelMode {
+    Box,
+    Columns,
+    Rows,
+    All,
+}
+
+#[derive(Clone, Copy)]
+struct Selection {
+    anchor: Cursor,
+    mode: SelMode,
+}
+
+struct Clip {
+    view: View,
+    col: usize,
+    kinds: Vec<Kind>,
+    cells: Vec<Vec<u8>>,
+}
+
+enum Modal {
+    Plugins {
+        instrument: u8,
+        list: Vec<PluginDescriptor>,
+        cur: usize,
+    },
+    Songs {
+        dir: PathBuf,
+        list: Vec<PathBuf>,
+        cur: usize,
+    },
+    Text {
+        label: &'static str,
+        value: String,
+        target: TextTarget,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum TextTarget {
+    SongName,
+    InstrumentName(u8),
+}
+
+/// Instrument view rows before the plugin parameters.
+const INST_FIELDS: usize = 5;
+
+/// Project view rows: (label, screen row).
+const PROJECT_FIELDS: [(&str, usize); 9] = [
+    ("TEMPO", 2),
+    ("TRANSPOSE", 3),
+    ("NAME", 4),
+    ("PROJECT", 6),
+    ("RENDER", 7),
+    ("OUTPUT", 10),
+    ("RATE", 11),
+    ("BUFFER", 12),
+    ("APPLY", 13),
+];
+
+pub struct Options {
+    pub path: Option<PathBuf>,
+    pub map: InstrumentMap,
+    pub use_device: bool,
+    pub audio: AudioSettings,
+    pub note_offset: i16,
+    /// Song row the cursor starts on.
+    pub row: usize,
+}
+
+pub struct App {
+    song: Song,
+    path: Option<PathBuf>,
+    map: InstrumentMap,
+    slots: Vec<Slot>,
+    missing: Vec<(u8, String)>,
+    rack: Option<Rack>,
+    use_device: bool,
+    audio: AudioSettings,
+    note_offset: i16,
+    audio_problem: Option<String>,
+
+    view: View,
+    cursors: HashMap<View, Cursor>,
+    song_top: usize,
+    chain: usize,
+    chain_ctx: Option<Ctx>,
+    phrase: usize,
+    phrase_ctx: Option<Ctx>,
+    instrument: u8,
+    inst_top: usize,
+    table: usize,
+    groove: usize,
+    project_col: usize,
+    render_seconds: u32,
+    devices: Vec<String>,
+
+    last: HashMap<Kind, u8>,
+    last_edit: Option<(Instant, View, usize, usize)>,
+    selection: Option<Selection>,
+    clip: Option<Clip>,
+    modal: Option<Modal>,
+    confirm: Option<(Instant, &'static str)>,
+    status: Option<(String, Instant)>,
+    preview: Option<(Instant, u8, i16)>,
+    /// Shown values of parameters just changed, until the plugin catches up.
+    param_hold: HashMap<(u8, u32), (f64, Instant)>,
+    params: Vec<ParamInfo>,
+    params_for: Option<(u8, usize)>,
+    muted: u8,
+    soloed: u8,
+    meter: f32,
+    dirty: bool,
+    unsaved: bool,
+    keys: Keys,
+    quit: bool,
+}
+
+impl App {
+    pub fn new(song: Song, o: Options) -> App {
+        let mut app = App {
+            song,
+            path: o.path,
+            map: o.map,
+            slots: Vec::new(),
+            missing: Vec::new(),
+            rack: None,
+            use_device: o.use_device,
+            audio: o.audio,
+            note_offset: o.note_offset,
+            audio_problem: None,
+            view: View::Song,
+            cursors: HashMap::new(),
+            song_top: 0,
+            chain: 0,
+            chain_ctx: None,
+            phrase: 0,
+            phrase_ctx: None,
+            instrument: 0,
+            inst_top: 0,
+            table: 0,
+            groove: 0,
+            project_col: 0,
+            render_seconds: 60,
+            devices: Vec::new(),
+            last: HashMap::new(),
+            last_edit: None,
+            selection: None,
+            clip: None,
+            modal: None,
+            confirm: None,
+            status: None,
+            preview: None,
+            param_hold: HashMap::new(),
+            params: Vec::new(),
+            params_for: None,
+            muted: 0,
+            soloed: 0,
+            meter: 0.0,
+            dirty: false,
+            unsaved: false,
+            keys: Keys::default(),
+            quit: false,
+        };
+        app.cursors.insert(
+            View::Song,
+            Cursor {
+                row: o.row.min(SONG_ROWS - 1),
+                col: 0,
+            },
+        );
+        app.rebuild_audio();
+        app
+    }
+
+    pub fn run<B: Backend>(&mut self, term: &mut Terminal<B>) -> Result<()> {
+        while !self.quit {
+            self.tick();
+            term.draw(|f| {
+                let mut s = Screen::new();
+                self.draw(&mut s);
+                s.render(f.area(), f.buffer_mut());
+            })?;
+            if event::poll(Duration::from_millis(25))? {
+                loop {
+                    if let Event::Key(k) = event::read()? {
+                        self.key(k);
+                    }
+                    if self.quit || !event::poll(Duration::ZERO)? {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn shutdown(mut self) {
+        self.stop_audio();
+    }
+
+    // --- housekeeping --------------------------------------------------------
+
+    fn tick(&mut self) {
+        let mut restart = false;
+        for s in &self.slots {
+            let sh = &s.plugin.shared;
+            if sh.callback_requested.swap(false, Ordering::AcqRel) {
+                s.plugin.on_main_thread();
+            }
+            let rescan = sh.rescan_flags.swap(0, Ordering::AcqRel);
+            if rescan & (CLAP_PARAM_RESCAN_INFO | CLAP_PARAM_RESCAN_ALL) != 0 {
+                self.params_for = None;
+            }
+            restart |= sh.restart_requested.swap(false, Ordering::AcqRel);
+        }
+        if restart {
+            self.rebuild_audio();
+        }
+        if self.dirty {
+            self.dirty = false;
+            if self.needs_new_plugins() {
+                self.rebuild_audio();
+            } else if let Some(r) = &self.rack {
+                r.shared.set_song(Arc::new(self.song.clone()));
+            }
+        }
+        if let Some((at, inst, note)) = self.preview {
+            if Instant::now() >= at {
+                if let Some(r) = &self.rack {
+                    r.shared.preview(inst, note, false);
+                }
+                self.preview = None;
+            }
+        }
+        if let Some(r) = &self.rack {
+            self.meter = r.shared.take_peak().max(self.meter * 0.8);
+        }
+        let now = Instant::now();
+        self.param_hold.retain(|_, (_, until)| *until > now);
+    }
+
+    fn changed(&mut self) {
+        self.dirty = true;
+        self.unsaved = true;
+    }
+
+    fn flash(&mut self, msg: impl Into<String>) {
+        self.status = Some((msg.into(), Instant::now()));
+    }
+
+    /// Whether the song now plays an instrument whose plugin isn't loaded.
+    fn needs_new_plugins(&self) -> bool {
+        let have: HashSet<u8> = self
+            .slots
+            .iter()
+            .map(|s| s.instrument)
+            .chain(self.missing.iter().map(|m| m.0))
+            .collect();
+        wanted_instruments(&self.song, &self.map)
+            .into_iter()
+            .any(|n| !have.contains(&n))
+    }
+
+    fn stop_audio(&mut self) {
+        if let Some(mut r) = self.rack.take() {
+            r.stop(&mut self.slots);
+        }
+    }
+
+    /// Load plugins for every instrument that needs one and (re)start audio.
+    /// Playback resumes from where it was.
+    fn rebuild_audio(&mut self) {
+        let resume = self
+            .rack
+            .as_ref()
+            .and_then(|r| (0..TRACKS).find_map(|t| r.shared.track(t).pos.map(|p| p.row)));
+        self.stop_audio();
+        let before: HashSet<(u8, PluginRef)> = self
+            .slots
+            .iter()
+            .map(|s| (s.instrument, s.source.clone()))
+            .collect();
+        let old = std::mem::take(&mut self.slots);
+        let (slots, missing) = load_slots_reusing(&self.song, &self.map, old);
+        for s in &slots {
+            if !before.contains(&(s.instrument, s.source.clone())) {
+                if let Some(state) = self.map.states.get(&s.instrument) {
+                    s.plugin.load_state(state);
+                }
+            }
+        }
+        self.slots = slots;
+        self.missing = missing;
+        self.params_for = None;
+        match Rack::start(
+            Arc::new(self.song.clone()),
+            &mut self.slots,
+            self.use_device,
+            &self.audio,
+            self.note_offset,
+        ) {
+            Ok((rack, problem)) => {
+                rack.shared.set_mutes(self.muted, self.soloed);
+                if let Some(row) = resume {
+                    rack.shared.play_from(row);
+                }
+                self.rack = Some(rack);
+                self.audio_problem = problem;
+            }
+            Err(e) => self.flash(format!("AUDIO: {e:#}")),
+        }
+    }
+
+    // --- keys ------------------------------------------------------------------
+
+    fn key(&mut self, k: KeyEvent) {
+        if matches!(self.modal, Some(Modal::Text { .. })) {
+            if k.kind != KeyEventKind::Release {
+                self.text_key(k);
+            }
+            return;
+        }
+        let releases = RELEASE_EVENTS.load(Ordering::Relaxed);
+        match self.keys.translate(k, releases) {
+            Input::Quit => self.quit = true,
+            Input::Press(p) => {
+                if self.modal.is_some() {
+                    self.modal_press(p);
+                } else {
+                    self.press(p);
+                }
+            }
+            Input::None => {}
+        }
+    }
+
+    fn press(&mut self, p: Press) {
+        let h = p.held;
+        if p.button == Button::Play {
+            return self.play(p);
+        }
+        if p.button.is_direction() && h.shift && !h.option && !h.edit {
+            return self.navigate(p.button);
+        }
+        if self.selection.is_some() && self.grid().is_some() {
+            return self.selection_press(p);
+        }
+        match p.button {
+            Button::Option if h.shift => self.start_selection(),
+            Button::Shift if h.option => self.mute_track(),
+            Button::Option if h.edit => self.delete(),
+            Button::Edit if h.option => self.delete(),
+            Button::Edit if h.shift => self.paste(),
+            Button::Edit if h.none() => self.edit_tap(),
+            b if b.is_direction() && h.edit => self.edit_adjust(b),
+            b if b.is_direction() && h.option => self.option_move(b),
+            b if b.is_direction() && h.none() => self.move_cursor(b),
+            _ => {}
+        }
+    }
+
+    // --- cursor and views --------------------------------------------------------
+
+    fn cur(&self) -> Cursor {
+        self.cursors.get(&self.view).copied().unwrap_or_default()
+    }
+
+    fn set_cur(&mut self, c: Cursor) {
+        self.cursors.insert(self.view, c);
+    }
+
+    /// Rows and column kinds of the current view, if it is a grid.
+    fn grid(&self) -> Option<(usize, &'static [Kind])> {
+        match self.view {
+            View::Song => Some((SONG_ROWS, &SONG_COLS)),
+            View::Chain => Some((STEPS, &CHAIN_COLS)),
+            View::Phrase => Some((STEPS, &PHRASE_COLS)),
+            View::Table => Some((STEPS, &TABLE_COLS)),
+            View::Groove => Some((STEPS, &GROOVE_COLS)),
+            _ => None,
+        }
+    }
+
+    /// Rows and columns the cursor can visit.
+    fn extent(&self) -> (usize, usize) {
+        match self.view {
+            View::Instrument => (INST_FIELDS + self.params.len(), 1),
+            View::Project => (PROJECT_FIELDS.len(), 1),
+            _ => self.grid().map_or((1, 1), |(r, c)| (r, c.len())),
+        }
+    }
+
+    fn move_cursor(&mut self, b: Button) {
+        let (rows, cols) = self.extent();
+        let mut c = self.cur();
+        if self.view == View::Project && c.row == 3 {
+            match b {
+                Button::Left => self.project_col = self.project_col.saturating_sub(1),
+                Button::Right => self.project_col = (self.project_col + 1).min(2),
+                _ => {}
+            }
+        }
+        match b {
+            Button::Up => c.row = c.row.saturating_sub(1),
+            Button::Down => c.row = (c.row + 1).min(rows - 1),
+            Button::Left => c.col = c.col.saturating_sub(1),
+            Button::Right => c.col = (c.col + 1).min(cols - 1),
+            _ => {}
+        }
+        self.set_cur(c);
+    }
+
+    /// SHIFT + direction: move between views along the M8's map.
+    fn navigate(&mut self, b: Button) {
+        let cur = self.cur();
+        let next = match (self.view, b) {
+            (View::Song, Button::Right) => {
+                let chain = self.song.rows[cur.row][cur.col];
+                if chain == EMPTY {
+                    return self.flash("NO CHAIN HERE");
+                }
+                self.chain = chain as usize;
+                self.chain_ctx = Some(Ctx {
+                    track: cur.col,
+                    row: cur.row,
+                    chain_step: 0,
+                });
+                View::Chain
+            }
+            (View::Song, Button::Up) => View::Project,
+            (View::Project, Button::Down) => View::Song,
+            (View::Chain, Button::Left) => View::Song,
+            (View::Chain, Button::Right) => {
+                let ph = self.song.chains[self.chain].steps[cur.row].phrase;
+                if ph == EMPTY {
+                    return self.flash("NO PHRASE HERE");
+                }
+                self.phrase = ph as usize;
+                self.phrase_ctx = self.chain_ctx.map(|c| Ctx {
+                    chain_step: cur.row,
+                    ..c
+                });
+                View::Phrase
+            }
+            (View::Phrase, Button::Left) => {
+                if let Some(c) = self.phrase_ctx {
+                    let chain = self.song.rows[c.row][c.track];
+                    if chain != EMPTY {
+                        self.chain = chain as usize;
+                        self.chain_ctx = Some(c);
+                        self.cursors.insert(
+                            View::Chain,
+                            Cursor {
+                                row: c.chain_step,
+                                col: 0,
+                            },
+                        );
+                    }
+                }
+                View::Chain
+            }
+            (View::Phrase, Button::Right) => {
+                let steps = &self.song.phrases[self.phrase].steps;
+                let inst = (0..=cur.row)
+                    .rev()
+                    .map(|r| steps[r].instrument)
+                    .find(|&i| i != EMPTY)
+                    .unwrap_or(self.instrument);
+                self.instrument = inst.min(INSTRUMENTS as u8 - 1);
+                View::Instrument
+            }
+            (View::Phrase, Button::Up) => View::Groove,
+            (View::Groove, Button::Down) => View::Phrase,
+            (View::Instrument, Button::Left) => View::Phrase,
+            (View::Instrument, Button::Right) => {
+                self.table = self.instrument as usize;
+                View::Table
+            }
+            (View::Table, Button::Left) => View::Instrument,
+            _ => return,
+        };
+        self.selection = None;
+        self.view = next;
+    }
+
+    /// OPTION + direction: next/previous chain, phrase, instrument...
+    fn option_move(&mut self, b: Button) {
+        let step: i32 = match b {
+            Button::Left | Button::Up => -1,
+            _ => 1,
+        };
+        let vertical = matches!(b, Button::Up | Button::Down);
+        match self.view {
+            View::Song => {
+                if vertical {
+                    let mut c = self.cur();
+                    c.row = (c.row as i32 + step * 16).clamp(0, SONG_ROWS as i32 - 1) as usize;
+                    self.set_cur(c);
+                }
+            }
+            View::Chain => {
+                let Some(mut ctx) = self.chain_ctx else {
+                    return;
+                };
+                if vertical {
+                    let r = ctx.row as i32 + step;
+                    if !(0..SONG_ROWS as i32).contains(&r) {
+                        return;
+                    }
+                    ctx.row = r as usize;
+                } else {
+                    let t = ctx.track as i32 + step;
+                    if !(0..TRACKS as i32).contains(&t) {
+                        return;
+                    }
+                    ctx.track = t as usize;
+                }
+                let chain = self.song.rows[ctx.row][ctx.track];
+                if chain != EMPTY {
+                    self.chain = chain as usize;
+                    self.chain_ctx = Some(ctx);
+                }
+            }
+            View::Phrase => {
+                let Some(mut ctx) = self.phrase_ctx else {
+                    return;
+                };
+                if vertical {
+                    let chain = self.song.rows[ctx.row][ctx.track];
+                    if chain == EMPTY {
+                        return;
+                    }
+                    let steps = &self.song.chains[chain as usize].steps;
+                    let mut s = ctx.chain_step as i32 + step;
+                    while (0..STEPS as i32).contains(&s) {
+                        if steps[s as usize].phrase != EMPTY {
+                            ctx.chain_step = s as usize;
+                            self.phrase = steps[s as usize].phrase as usize;
+                            self.phrase_ctx = Some(ctx);
+                            return;
+                        }
+                        s += step;
+                    }
+                } else {
+                    let t = ctx.track as i32 + step;
+                    if !(0..TRACKS as i32).contains(&t) {
+                        return;
+                    }
+                    ctx.track = t as usize;
+                    let chain = self.song.rows[ctx.row][ctx.track];
+                    if chain == EMPTY {
+                        return;
+                    }
+                    let steps = &self.song.chains[chain as usize].steps;
+                    let pick = if steps[ctx.chain_step].phrase != EMPTY {
+                        Some(ctx.chain_step)
+                    } else {
+                        (0..STEPS).find(|&s| steps[s].phrase != EMPTY)
+                    };
+                    if let Some(s) = pick {
+                        ctx.chain_step = s;
+                        self.phrase = steps[s].phrase as usize;
+                        self.phrase_ctx = Some(ctx);
+                    }
+                }
+            }
+            View::Instrument => {
+                let d = if vertical { step * 16 } else { step };
+                self.instrument =
+                    (self.instrument as i32 + d).clamp(0, INSTRUMENTS as i32 - 1) as u8;
+            }
+            View::Table => {
+                let d = if vertical { step * 16 } else { step };
+                self.table = (self.table as i32 + d).clamp(0, TABLES as i32 - 1) as usize;
+            }
+            View::Groove => {
+                let d = if vertical { step * 16 } else { step };
+                self.groove = (self.groove as i32 + d).clamp(0, GROOVES as i32 - 1) as usize;
+            }
+            View::Project => {}
+        }
+    }
+
+    // --- playback ---------------------------------------------------------------
+
+    fn play(&mut self, p: Press) {
+        let Some(rack) = &self.rack else {
+            return self.flash("NO AUDIO");
+        };
+        let sh = rack.shared.clone();
+        let h = p.held;
+        if h.edit {
+            // Preview the instrument.
+            let inst = match self.view {
+                View::Instrument | View::Table => self.instrument,
+                _ => self.last.get(&Kind::Instrument).copied().unwrap_or(0),
+            };
+            return self.preview_note(inst, 36);
+        }
+        let track = self.current_track();
+        if h.option && h.shift {
+            self.muted = 0;
+            self.soloed = 0;
+            sh.set_mutes(0, 0);
+            return;
+        }
+        if h.option {
+            self.soloed ^= 1 << track;
+            sh.set_mutes(self.muted, self.soloed);
+            return;
+        }
+        if sh.is_playing() {
+            return sh.stop_song();
+        }
+        let song_row = self.cursors.get(&View::Song).map_or(0, |c| c.row);
+        match (self.view, h.shift) {
+            (View::Chain, false) => match self.chain_ctx {
+                Some(c) => sh.play_chain(c.track, c.row),
+                None => sh.play_from(song_row),
+            },
+            (View::Chain, true) => sh.play_from(self.chain_ctx.map_or(song_row, |c| c.row)),
+            (View::Phrase | View::Instrument | View::Table, false) => {
+                let c = self.phrase_ctx.unwrap_or(Ctx {
+                    track: 0,
+                    row: song_row,
+                    chain_step: 0,
+                });
+                let chain = self.song.rows[c.row][c.track];
+                sh.play_phrase(
+                    c.track,
+                    Pos {
+                        row: c.row,
+                        chain: if chain == EMPTY { 0 } else { chain as usize },
+                        chain_step: c.chain_step,
+                        phrase: self.phrase,
+                        phrase_step: 0,
+                    },
+                );
+            }
+            (View::Phrase | View::Instrument | View::Table, true) => {
+                sh.play_from(self.phrase_ctx.map_or(song_row, |c| c.row))
+            }
+            _ => sh.play_from(song_row),
+        }
+    }
+
+    fn current_track(&self) -> usize {
+        match self.view {
+            View::Song => self.cur().col,
+            View::Chain => self.chain_ctx.map_or(0, |c| c.track),
+            _ => self.phrase_ctx.map_or(0, |c| c.track),
+        }
+    }
+
+    fn mute_track(&mut self) {
+        let t = self.current_track();
+        self.muted ^= 1 << t;
+        if let Some(r) = &self.rack {
+            r.shared.set_mutes(self.muted, self.soloed);
+        }
+    }
+
+    fn preview_note(&mut self, inst: u8, note: u8) {
+        let Some(r) = &self.rack else { return };
+        if let Some((_, i, n)) = self.preview.take() {
+            r.shared.preview(i, n, false);
+        }
+        r.shared.preview(inst, note as i16, true);
+        self.preview = Some((
+            Instant::now() + Duration::from_millis(400),
+            inst,
+            note as i16,
+        ));
+    }
+
+    // --- grid cells -------------------------------------------------------------
+
+    fn cell(&self, view: View, r: usize, c: usize) -> u8 {
+        match view {
+            View::Song => self.song.rows[r][c],
+            View::Chain => {
+                let s = self.song.chains[self.chain].steps[r];
+                [s.phrase, s.transpose][c]
+            }
+            View::Phrase => {
+                let s = &self.song.phrases[self.phrase].steps[r];
+                match c {
+                    0 => s.note,
+                    1 => s.volume,
+                    2 => s.instrument,
+                    _ => {
+                        let fx = s.fx[(c - 3) / 2];
+                        if (c - 3) % 2 == 0 {
+                            fx.command
+                        } else {
+                            fx.value
+                        }
+                    }
+                }
+            }
+            View::Table => {
+                let s = &self.song.tables[self.table].steps[r];
+                match c {
+                    0 => s.transpose,
+                    1 => s.volume,
+                    _ => {
+                        let fx = s.fx[(c - 2) / 2];
+                        if (c - 2) % 2 == 0 {
+                            fx.command
+                        } else {
+                            fx.value
+                        }
+                    }
+                }
+            }
+            View::Groove => self.song.grooves[self.groove].steps[r],
+            _ => EMPTY,
+        }
+    }
+
+    fn set_cell(&mut self, view: View, r: usize, c: usize, v: u8) {
+        match view {
+            View::Song => self.song.rows[r][c] = v,
+            View::Chain => {
+                let s = &mut self.song.chains[self.chain].steps[r];
+                match c {
+                    0 => s.phrase = v,
+                    _ => s.transpose = v,
+                }
+            }
+            View::Phrase => {
+                let s = &mut self.song.phrases[self.phrase].steps[r];
+                match c {
+                    0 => s.note = v,
+                    1 => s.volume = v,
+                    2 => s.instrument = v,
+                    _ => {
+                        let fx = &mut s.fx[(c - 3) / 2];
+                        if (c - 3) % 2 == 0 {
+                            fx.command = v
+                        } else {
+                            fx.value = v
+                        }
+                    }
+                }
+            }
+            View::Table => {
+                let s = &mut self.song.tables[self.table].steps[r];
+                match c {
+                    0 => s.transpose = v,
+                    1 => s.volume = v,
+                    _ => {
+                        let fx = &mut s.fx[(c - 2) / 2];
+                        if (c - 2) % 2 == 0 {
+                            fx.command = v
+                        } else {
+                            fx.value = v
+                        }
+                    }
+                }
+            }
+            View::Groove => self.song.grooves[self.groove].steps[r] = v,
+            _ => return,
+        }
+        self.changed();
+    }
+
+    fn kind_at(&self, c: usize) -> Option<Kind> {
+        self.grid().and_then(|(_, cols)| cols.get(c).copied())
+    }
+
+    // --- editing ---------------------------------------------------------------
+
+    /// EDIT on its own: insert on an empty cell, a new chain/phrase/instrument
+    /// on a double tap.
+    fn edit_tap(&mut self) {
+        match self.view {
+            View::Instrument => return self.instrument_edit(0),
+            View::Project => return self.project_edit(0),
+            _ => {}
+        }
+        let c = self.cur();
+        let Some(kind) = self.kind_at(c.col) else {
+            return;
+        };
+        let now = Instant::now();
+        let double = self.last_edit.is_some_and(|(t, v, r, col)| {
+            now - t < DOUBLE_TAP && v == self.view && r == c.row && col == c.col
+        });
+        self.last_edit = Some((now, self.view, c.row, c.col));
+        let val = self.cell(self.view, c.row, c.col);
+        if double && matches!(kind, Kind::Chain | Kind::Phrase | Kind::Instrument) {
+            if let Some(n) = self.unused(kind) {
+                self.set_cell(self.view, c.row, c.col, n);
+                self.last.insert(kind, n);
+                self.flash(format!("NEW {} {n:02X}", kind_name(kind)));
+            }
+            return;
+        }
+        if val == EMPTY && kind.can_be_empty() {
+            let v = self.last.get(&kind).copied().unwrap_or(kind.default());
+            self.insert(c, kind, v);
+        } else if kind == Kind::Note && val < 0x80 {
+            self.preview_step(c.row);
+        }
+    }
+
+    /// Put `v` into an empty cell, with what the M8 fills in alongside it.
+    fn insert(&mut self, c: Cursor, kind: Kind, v: u8) {
+        self.set_cell(self.view, c.row, c.col, v);
+        match kind {
+            Kind::Note if self.view == View::Phrase => {
+                if self.cell(View::Phrase, c.row, 2) == EMPTY {
+                    let inst = self.last.get(&Kind::Instrument).copied().unwrap_or(0);
+                    self.set_cell(View::Phrase, c.row, 2, inst);
+                }
+                self.preview_step(c.row);
+            }
+            Kind::FxCmd => {
+                let val = self.last.get(&Kind::FxVal).copied().unwrap_or(0);
+                self.set_cell(self.view, c.row, c.col + 1, val);
+            }
+            _ => {}
+        }
+    }
+
+    fn preview_step(&mut self, row: usize) {
+        let s = self.song.phrases[self.phrase].steps[row];
+        if s.note >= 0x80 {
+            return;
+        }
+        let inst = if s.instrument == EMPTY {
+            0
+        } else {
+            s.instrument
+        };
+        self.preview_note(inst, s.note);
+    }
+
+    /// EDIT + direction: change the value under the cursor.
+    fn edit_adjust(&mut self, b: Button) {
+        let delta_for = |kind_big: i32| match b {
+            Button::Left => -1,
+            Button::Right => 1,
+            Button::Down => -kind_big,
+            _ => kind_big,
+        };
+        match self.view {
+            View::Instrument => return self.instrument_edit(delta_for(16)),
+            View::Project => return self.project_edit(delta_for(10)),
+            _ => {}
+        }
+        let c = self.cur();
+        let Some(kind) = self.kind_at(c.col) else {
+            return;
+        };
+        let val = self.cell(self.view, c.row, c.col);
+        if val == EMPTY && kind.can_be_empty() {
+            let v = self.last.get(&kind).copied().unwrap_or(kind.default());
+            return self.insert(c, kind, v);
+        }
+        if kind == Kind::Note && val >= 0x80 {
+            return;
+        }
+        let d = delta_for(kind.big_step());
+        let v = if kind == Kind::Transpose {
+            (val as i32 + d).rem_euclid(256) as u8
+        } else {
+            (val as i32 + d).clamp(0, kind.max() as i32) as u8
+        };
+        if v != val {
+            self.set_cell(self.view, c.row, c.col, v);
+        }
+        self.last.insert(kind, v);
+        if kind == Kind::Note {
+            self.preview_step(c.row);
+        }
+    }
+
+    /// EDIT + OPTION: clear the value (an empty note becomes OFF).
+    fn delete(&mut self) {
+        match self.view {
+            View::Instrument => return self.instrument_reset(),
+            View::Project => return,
+            _ => {}
+        }
+        let c = self.cur();
+        let Some(kind) = self.kind_at(c.col) else {
+            return;
+        };
+        let val = self.cell(self.view, c.row, c.col);
+        if val != EMPTY && kind.can_be_empty() {
+            self.last.insert(kind, val);
+        }
+        match kind {
+            Kind::Note if val == EMPTY => self.set_cell(self.view, c.row, c.col, 0x80),
+            Kind::Transpose | Kind::FxVal => self.set_cell(self.view, c.row, c.col, 0),
+            Kind::FxCmd => {
+                self.set_cell(self.view, c.row, c.col, EMPTY);
+                self.set_cell(self.view, c.row, c.col + 1, 0);
+            }
+            _ => self.set_cell(self.view, c.row, c.col, EMPTY),
+        }
+    }
+
+    /// The first chain, phrase or instrument nothing uses yet.
+    fn unused(&self, kind: Kind) -> Option<u8> {
+        let s = &self.song;
+        match kind {
+            Kind::Chain => (0..CHAINS).find(|&c| {
+                !s.rows.iter().any(|r| r.contains(&(c as u8)))
+                    && s.chains[c].steps.iter().all(|st| st.phrase == EMPTY)
+            }),
+            Kind::Phrase => (0..PHRASES).find(|&p| {
+                !s.chains
+                    .iter()
+                    .any(|c| c.steps.iter().any(|st| st.phrase == p as u8))
+                    && s.phrases[p]
+                        .steps
+                        .iter()
+                        .all(|st| st.note == EMPTY && st.instrument == EMPTY)
+            }),
+            Kind::Instrument => {
+                let used = s.used_instruments();
+                let own: HashSet<u8> = self.map.numbered().collect();
+                (0..INSTRUMENTS).find(|&i| {
+                    s.instruments[i].kind == InstrumentKind::None
+                        && !used.contains(&(i as u8))
+                        && !own.contains(&(i as u8))
+                })
+            }
+            _ => None,
+        }
+        .map(|n| n as u8)
+    }
+
+    // --- selection, copy and paste ---------------------------------------------
+
+    fn start_selection(&mut self) {
+        if self.grid().is_none() {
+            return;
+        }
+        self.selection = Some(Selection {
+            anchor: self.cur(),
+            mode: SelMode::Box,
+        });
+        self.flash("SELECT: OPTION COPIES, EDIT+OPTION CUTS");
+    }
+
+    /// The selected rectangle: (row0, col0, row1, col1), inclusive.
+    fn selected(&self) -> Option<(usize, usize, usize, usize)> {
+        let s = self.selection?;
+        let (rows, cols) = self.extent();
+        let c = self.cur();
+        let (r0, r1) = (s.anchor.row.min(c.row), s.anchor.row.max(c.row));
+        let (c0, c1) = (s.anchor.col.min(c.col), s.anchor.col.max(c.col));
+        Some(match s.mode {
+            SelMode::Box => (r0, c0, r1, c1),
+            SelMode::Columns => (0, c0, rows - 1, c1),
+            SelMode::Rows => (r0, 0, r1, cols - 1),
+            SelMode::All => (0, 0, rows - 1, cols - 1),
+        })
+    }
+
+    fn selection_press(&mut self, p: Press) {
+        let h = p.held;
+        match p.button {
+            Button::Option if h.shift => {
+                let s = self.selection.as_mut().unwrap();
+                s.mode = match s.mode {
+                    SelMode::Box => SelMode::Columns,
+                    SelMode::Columns => SelMode::Rows,
+                    SelMode::Rows => SelMode::All,
+                    SelMode::All => {
+                        self.selection = None;
+                        return;
+                    }
+                };
+            }
+            Button::Option if h.edit => {
+                self.copy_selection();
+                self.clear_selection_cells();
+                self.selection = None;
+                self.flash("CUT");
+            }
+            Button::Edit if h.option => {
+                self.copy_selection();
+                self.clear_selection_cells();
+                self.selection = None;
+                self.flash("CUT");
+            }
+            Button::Option if h.none() => {
+                self.copy_selection();
+                self.selection = None;
+                self.flash("COPIED");
+            }
+            Button::Edit if h.shift => {
+                self.selection = None;
+                self.clone_under_cursor();
+            }
+            b if b.is_direction() && h.none() => self.move_cursor(b),
+            _ => {}
+        }
+    }
+
+    fn copy_selection(&mut self) {
+        let Some((r0, c0, r1, c1)) = self.selected() else {
+            return;
+        };
+        let Some((_, kinds)) = self.grid() else {
+            return;
+        };
+        let cells = (r0..=r1)
+            .map(|r| (c0..=c1).map(|c| self.cell(self.view, r, c)).collect())
+            .collect();
+        self.clip = Some(Clip {
+            view: self.view,
+            col: c0,
+            kinds: kinds[c0..=c1].to_vec(),
+            cells,
+        });
+    }
+
+    fn clear_selection_cells(&mut self) {
+        let Some((r0, c0, r1, c1)) = self.selected() else {
+            return;
+        };
+        for r in r0..=r1 {
+            for c in c0..=c1 {
+                let kind = self.kind_at(c).unwrap();
+                let v = if kind.can_be_empty() { EMPTY } else { 0 };
+                self.set_cell(self.view, r, c, v);
+            }
+        }
+    }
+
+    /// SHIFT + EDIT: paste at the cursor. Columns of another kind are pasted
+    /// back into the columns they came from.
+    fn paste(&mut self) {
+        let Some(clip) = self.clip.take() else {
+            return self.flash("NOTHING TO PASTE");
+        };
+        let (rows, kinds) = match self.grid() {
+            Some(g) if clip.view == self.view => g,
+            _ => {
+                self.clip = Some(clip);
+                return self.flash("CAN'T PASTE HERE");
+            }
+        };
+        let c = self.cur();
+        let fits = c.col + clip.kinds.len() <= kinds.len()
+            && kinds[c.col..c.col + clip.kinds.len()] == clip.kinds[..];
+        let col0 = if fits { c.col } else { clip.col };
+        for (i, row) in clip.cells.iter().enumerate() {
+            let r = c.row + i;
+            if r >= rows {
+                break;
+            }
+            for (j, &v) in row.iter().enumerate() {
+                self.set_cell(self.view, r, col0 + j, v);
+            }
+        }
+        self.clip = Some(clip);
+    }
+
+    /// SHIFT+OPTION then EDIT on a chain, phrase or instrument number: copy
+    /// it to an unused number and point the cell there.
+    fn clone_under_cursor(&mut self) {
+        let c = self.cur();
+        let Some(kind) = self.kind_at(c.col) else {
+            return;
+        };
+        let val = self.cell(self.view, c.row, c.col);
+        if val == EMPTY || !matches!(kind, Kind::Chain | Kind::Phrase | Kind::Instrument) {
+            return;
+        }
+        let Some(n) = self.unused(kind) else {
+            return self.flash("NONE FREE");
+        };
+        let (from, to) = (val as usize, n as usize);
+        match kind {
+            Kind::Chain => self.song.chains[to] = self.song.chains[from].clone(),
+            Kind::Phrase => self.song.phrases[to] = self.song.phrases[from].clone(),
+            _ => {
+                self.song.instruments[to] = self.song.instruments[from].clone();
+                if let Some(slot) = self.slots.iter().find(|s| s.instrument == val) {
+                    self.map.set_number(n, Some(slot.source.clone()));
+                    if let Some(state) = slot.plugin.save_state() {
+                        self.map.states.insert(n, state);
+                    }
+                }
+            }
+        }
+        self.set_cell(self.view, c.row, c.col, n);
+        self.flash(format!("CLONED {} {val:02X} TO {n:02X}", kind_name(kind)));
+    }
+
+    // --- instrument view ------------------------------------------------------
+
+    fn slot(&self, inst: u8) -> Option<&Slot> {
+        self.slots.iter().find(|s| s.instrument == inst)
+    }
+
+    fn refresh_params(&mut self) {
+        let key = (self.instrument, self.slots.len());
+        if self.params_for == Some(key) {
+            return;
+        }
+        self.params = self
+            .slot(self.instrument)
+            .map(|s| {
+                s.plugin
+                    .params()
+                    .into_iter()
+                    .filter(|p| !p.is_hidden())
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.params_for = Some(key);
+        let mut c = self
+            .cursors
+            .get(&View::Instrument)
+            .copied()
+            .unwrap_or_default();
+        c.row = c.row.min(INST_FIELDS + self.params.len().max(1) - 1);
+        self.cursors.insert(View::Instrument, c);
+    }
+
+    /// EDIT (delta 0) or EDIT+direction on an instrument view row.
+    fn instrument_edit(&mut self, delta: i32) {
+        let n = self.instrument;
+        let row = self.cur().row;
+        let inst = &mut self.song.instruments[n as usize];
+        match row {
+            0 => {
+                const KINDS: [InstrumentKind; 6] = [
+                    InstrumentKind::Wavsynth,
+                    InstrumentKind::Macrosynth,
+                    InstrumentKind::Sampler,
+                    InstrumentKind::MidiOut,
+                    InstrumentKind::FmSynth,
+                    InstrumentKind::None,
+                ];
+                let i = KINDS.iter().position(|k| *k == inst.kind).unwrap_or(5) as i32;
+                let i = (i + delta.signum()).rem_euclid(KINDS.len() as i32);
+                inst.kind = KINDS[i as usize];
+                self.changed();
+            }
+            1 if delta == 0 => {
+                self.modal = Some(Modal::Text {
+                    label: "NAME",
+                    value: inst.name.clone(),
+                    target: TextTarget::InstrumentName(n),
+                })
+            }
+            2 if delta == 0 => self.open_plugin_browser(n),
+            3 if delta != 0 => {
+                inst.transpose = !inst.transpose;
+                self.changed();
+            }
+            4 if delta != 0 => {
+                inst.table_tick = (inst.table_tick as i32 + delta).clamp(0, 0xFF) as u8;
+                self.changed();
+            }
+            r if r >= INST_FIELDS && delta != 0 => self.nudge_param(r - INST_FIELDS, delta),
+            _ => {}
+        }
+    }
+
+    /// EDIT+OPTION on the instrument view: plugin row removes the plugin,
+    /// a parameter goes back to its default.
+    fn instrument_reset(&mut self) {
+        let n = self.instrument;
+        match self.cur().row {
+            2 => {
+                self.map.set_number(n, None);
+                self.map.states.remove(&n);
+                self.unsaved = true;
+                self.rebuild_audio();
+            }
+            r if r >= INST_FIELDS => {
+                if let Some(p) = self.params.get(r - INST_FIELDS).cloned() {
+                    self.set_param(&p, p.default);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn param_value(&self, p: &ParamInfo) -> f64 {
+        if let Some((v, _)) = self.param_hold.get(&(self.instrument, p.id)) {
+            return *v;
+        }
+        self.slot(self.instrument)
+            .and_then(|s| s.plugin.param_value(p.id))
+            .unwrap_or(p.default)
+    }
+
+    fn nudge_param(&mut self, i: usize, delta: i32) {
+        let Some(p) = self.params.get(i).cloned() else {
+            return;
+        };
+        if p.is_readonly() {
+            return;
+        }
+        let range = p.max - p.min;
+        let v = self.param_value(&p);
+        let next = if p.is_stepped() {
+            let step = if delta.abs() > 1 {
+                (range / 10.0).round().max(1.0)
+            } else {
+                1.0
+            };
+            v.round() + delta.signum() as f64 * step
+        } else {
+            let frac = if delta.abs() > 1 { 0.1 } else { 0.01 };
+            v + delta.signum() as f64 * frac * range
+        };
+        self.set_param(&p, next.clamp(p.min, p.max));
+    }
+
+    fn set_param(&mut self, p: &ParamInfo, v: f64) {
+        let n = self.instrument;
+        let change = ParamChange {
+            id: p.id,
+            cookie: p.cookie,
+            value: v,
+        };
+        let Some(slot) = self.slot(n) else { return };
+        match &self.rack {
+            Some(r) if slot.plugin.is_active() => r.shared.set_param(n, change),
+            _ => slot.plugin.flush_inactive(&[change]),
+        }
+        self.param_hold
+            .insert((n, p.id), (v, Instant::now() + Duration::from_millis(300)));
+        self.unsaved = true;
+    }
+
+    fn open_plugin_browser(&mut self, instrument: u8) {
+        self.flash("SCANNING PLUGINS...");
+        let scan = crate::discovery::scan_default();
+        if scan.plugins.is_empty() {
+            return self.flash("NO CLAP PLUGINS FOUND");
+        }
+        self.modal = Some(Modal::Plugins {
+            instrument,
+            list: scan.plugins,
+            cur: 0,
+        });
+    }
+
+    // --- project view -----------------------------------------------------------
+
+    fn project_edit(&mut self, delta: i32) {
+        let row = self.cur().row;
+        match row {
+            0 if delta != 0 => {
+                let step = if delta.abs() > 1 { 10.0 } else { 1.0 };
+                self.song.tempo =
+                    (self.song.tempo + delta.signum() as f32 * step).clamp(1.0, 999.0);
+                self.changed();
+            }
+            1 if delta != 0 => {
+                self.song.transpose = (self.song.transpose as i32 + delta).rem_euclid(256) as u8;
+                self.changed();
+            }
+            2 if delta == 0 => {
+                self.modal = Some(Modal::Text {
+                    label: "NAME",
+                    value: self.song.name.clone(),
+                    target: TextTarget::SongName,
+                })
+            }
+            3 if delta == 0 => match self.project_col {
+                0 => self.save(),
+                1 => {
+                    if self.confirmed("LOAD") {
+                        self.open_song_browser();
+                    }
+                }
+                _ => {
+                    if self.confirmed("NEW") {
+                        self.new_song();
+                    }
+                }
+            },
+            4 if delta != 0 => {
+                self.render_seconds = (self.render_seconds as i32 + delta).clamp(1, 3600) as u32;
+            }
+            4 => self.render(),
+            5 if delta != 0 => {
+                if self.devices.is_empty() {
+                    self.devices = audio::output_devices();
+                }
+                let mut opts: Vec<Option<String>> = vec![None];
+                opts.extend(self.devices.iter().cloned().map(Some));
+                self.audio.device = cycle(&opts, &self.audio.device, delta);
+            }
+            6 if delta != 0 => {
+                let mut opts = vec![None];
+                opts.extend(settings::SAMPLE_RATES.iter().copied().map(Some));
+                self.audio.sample_rate = cycle(&opts, &self.audio.sample_rate, delta);
+            }
+            7 if delta != 0 => {
+                let mut opts = vec![None];
+                opts.extend(settings::BUFFER_SIZES.iter().copied().map(Some));
+                self.audio.buffer_size = cycle(&opts, &self.audio.buffer_size, delta);
+            }
+            8 if delta == 0 => {
+                self.use_device = true;
+                self.rebuild_audio();
+                match self.audio.save() {
+                    Ok(_) => self.flash("AUDIO SETTINGS SAVED"),
+                    Err(e) => self.flash(format!("{e:#}")),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Ask for a second EDIT before throwing away unsaved work.
+    fn confirmed(&mut self, what: &'static str) -> bool {
+        if !self.unsaved {
+            return true;
+        }
+        if let Some((at, w)) = self.confirm {
+            if w == what && at.elapsed() < Duration::from_secs(3) {
+                self.confirm = None;
+                return true;
+            }
+        }
+        self.confirm = Some((Instant::now(), what));
+        self.flash(format!("UNSAVED CHANGES. EDIT AGAIN TO {what}"));
+        false
+    }
+
+    fn song_path(&self) -> PathBuf {
+        self.path.clone().unwrap_or_else(|| {
+            let name = if self.song.name.is_empty() {
+                "UNTITLED"
+            } else {
+                &self.song.name
+            };
+            PathBuf::from(format!("{name}.m8s"))
+        })
+    }
+
+    fn save(&mut self) {
+        let path = self.song_path();
+        for s in &self.slots {
+            if let Some(state) = s.plugin.save_state() {
+                self.map.states.insert(s.instrument, state);
+            }
+        }
+        let result = self
+            .song
+            .save(&path)
+            .and_then(|_| self.map.save(&super::app::sidecar(&path), &self.song.name));
+        match result {
+            Ok(()) => {
+                self.path = Some(path.clone());
+                self.unsaved = false;
+                self.flash(format!("SAVED {}", file_name(&path)));
+            }
+            Err(e) => self.flash(format!("SAVE FAILED: {e:#}")),
+        }
+    }
+
+    fn open_song_browser(&mut self) {
+        let dir = self
+            .path
+            .as_ref()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or_else(|| PathBuf::from("."));
+        self.browse_songs(dir);
+    }
+
+    fn browse_songs(&mut self, dir: PathBuf) {
+        let mut list = vec![dir.join("..")];
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            let mut entries: Vec<PathBuf> = rd
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.is_dir() || p.extension().is_some_and(|e| e.eq_ignore_ascii_case("m8s"))
+                })
+                .collect();
+            entries.sort();
+            list.extend(entries);
+        }
+        self.modal = Some(Modal::Songs { dir, list, cur: 0 });
+    }
+
+    fn load_song(&mut self, path: PathBuf) {
+        match super::app::load_song_and_map(&path) {
+            Ok((song, map)) => {
+                self.stop_audio();
+                self.slots.clear();
+                self.song = song;
+                self.map = map;
+                self.path = Some(path.clone());
+                self.reset_views();
+                self.rebuild_audio();
+                self.flash(format!("LOADED {}", file_name(&path)));
+            }
+            Err(e) => self.flash(format!("{e:#}")),
+        }
+    }
+
+    fn new_song(&mut self) {
+        self.stop_audio();
+        self.slots.clear();
+        self.song = Song::new_empty();
+        self.map = InstrumentMap::default();
+        self.path = None;
+        self.reset_views();
+        self.rebuild_audio();
+        self.flash("NEW SONG");
+    }
+
+    fn reset_views(&mut self) {
+        self.cursors.clear();
+        self.song_top = 0;
+        self.chain = 0;
+        self.chain_ctx = None;
+        self.phrase = 0;
+        self.phrase_ctx = None;
+        self.instrument = 0;
+        self.table = 0;
+        self.groove = 0;
+        self.selection = None;
+        self.unsaved = false;
+        self.muted = 0;
+        self.soloed = 0;
+        self.view = View::Song;
+    }
+
+    fn render(&mut self) {
+        let out = self.song_path().with_extension("wav");
+        self.stop_audio();
+        let rate = self.audio.sample_rate.unwrap_or(48_000);
+        let r = render_wav(
+            Arc::new(self.song.clone()),
+            &mut self.slots,
+            0,
+            self.render_seconds as f64,
+            rate,
+            self.note_offset,
+            &out,
+        );
+        self.rebuild_audio();
+        match r {
+            Ok(()) => self.flash(format!("RENDERED {}", file_name(&out))),
+            Err(e) => self.flash(format!("RENDER FAILED: {e:#}")),
+        }
+    }
+
+    // --- modal screens ------------------------------------------------------------
+
+    fn modal_press(&mut self, p: Press) {
+        let Some(modal) = self.modal.as_mut() else {
+            return;
+        };
+        let (len, cur) = match modal {
+            Modal::Plugins { list, cur, .. } => (list.len(), cur),
+            Modal::Songs { list, cur, .. } => (list.len(), cur),
+            Modal::Text { .. } => return,
+        };
+        let page = if p.held.option { 16 } else { 1 };
+        match p.button {
+            Button::Up => *cur = cur.saturating_sub(page),
+            Button::Down => *cur = (*cur + page).min(len.saturating_sub(1)),
+            Button::Option if p.held.none() => self.modal = None,
+            Button::Edit if p.held.none() => self.modal_choose(),
+            _ => {}
+        }
+    }
+
+    fn modal_choose(&mut self) {
+        match self.modal.take() {
+            Some(Modal::Plugins {
+                instrument,
+                list,
+                cur,
+            }) => {
+                let d = &list[cur];
+                self.map.set_number(
+                    instrument,
+                    Some(PluginRef {
+                        path: d.path.clone(),
+                        id: Some(d.id.clone()),
+                    }),
+                );
+                self.map.states.remove(&instrument);
+                let inst = &mut self.song.instruments[instrument as usize];
+                if inst.kind == InstrumentKind::None {
+                    inst.kind = InstrumentKind::Wavsynth;
+                }
+                if inst.name.is_empty() {
+                    inst.name = d.name.to_uppercase().chars().take(12).collect();
+                }
+                self.changed();
+                self.rebuild_audio();
+                self.flash(format!("{} ON {instrument:02X}", d.name));
+            }
+            Some(Modal::Songs { list, cur, .. }) => {
+                let p = list[cur].clone();
+                if p.is_dir() {
+                    let dir = p.canonicalize().unwrap_or(p);
+                    self.browse_songs(dir);
+                } else {
+                    self.load_song(p);
+                }
+            }
+            other => self.modal = other,
+        }
+    }
+
+    fn text_key(&mut self, k: KeyEvent) {
+        let Some(Modal::Text { value, target, .. }) = self.modal.as_mut() else {
+            return;
+        };
+        match k.code {
+            KeyCode::Enter => {
+                let v = value.clone();
+                match *target {
+                    TextTarget::SongName => self.song.name = v,
+                    TextTarget::InstrumentName(n) => self.song.instruments[n as usize].name = v,
+                }
+                self.modal = None;
+                self.changed();
+            }
+            KeyCode::Esc => self.modal = None,
+            KeyCode::Backspace => {
+                value.pop();
+            }
+            KeyCode::Char(c) if (' '..='~').contains(&c) && value.len() < 12 => {
+                value.push(c.to_ascii_uppercase())
+            }
+            _ => {}
+        }
+    }
+
+    // --- drawing ---------------------------------------------------------------
+
+    fn draw(&mut self, s: &mut Screen) {
+        if self.view == View::Instrument {
+            self.refresh_params();
+        }
+        match &self.modal {
+            Some(Modal::Plugins { list, cur, .. }) => {
+                let rows: Vec<(String, String)> = list
+                    .iter()
+                    .map(|d| (d.name.clone(), d.vendor.clone()))
+                    .collect();
+                draw_list(s, "CLAP PLUGINS", &rows, *cur);
+                self.draw_status(s);
+                return;
+            }
+            Some(Modal::Songs { list, cur, dir }) => {
+                let rows: Vec<(String, String)> = list
+                    .iter()
+                    .map(|p| {
+                        let name = if p.ends_with("..") {
+                            "/..".to_string()
+                        } else {
+                            file_name(p)
+                        };
+                        (
+                            name,
+                            if p.is_dir() {
+                                "DIR".into()
+                            } else {
+                                String::new()
+                            },
+                        )
+                    })
+                    .collect();
+                let title = format!("LOAD {}", file_name(dir));
+                draw_list(s, &title, &rows, *cur);
+                self.draw_status(s);
+                return;
+            }
+            _ => {}
+        }
+        match self.view {
+            View::Song => self.draw_song(s),
+            View::Chain => self.draw_chain(s),
+            View::Phrase => self.draw_phrase(s),
+            View::Instrument => self.draw_instrument(s),
+            View::Table => self.draw_table(s),
+            View::Groove => self.draw_groove(s),
+            View::Project => self.draw_project(s),
+        }
+        self.draw_panel(s);
+        self.draw_status(s);
+    }
+
+    fn positions(&self) -> [Option<Pos>; TRACKS] {
+        let mut out = [None; TRACKS];
+        if let Some(r) = &self.rack {
+            for (t, o) in out.iter_mut().enumerate() {
+                *o = r.shared.track(t).pos;
+            }
+        }
+        out
+    }
+
+    /// Highlight the cursor and selection over a grid drawn at `geom`.
+    fn grid_overlay(&self, s: &mut Screen, geom: &[(usize, usize)], top: usize) {
+        let c = self.cur();
+        if let Some((r0, c0, r1, c1)) = self.selected() {
+            for r in r0..=r1 {
+                if r < top || r >= top + VISIBLE {
+                    continue;
+                }
+                for &(x, w) in &geom[c0..=c1] {
+                    s.highlight(x, GRID_Y + r - top, w, Role::Selection);
+                }
+            }
+        }
+        if c.row >= top && c.row < top + VISIBLE {
+            let (x, w) = geom[c.col.min(geom.len() - 1)];
+            s.highlight(x, GRID_Y + c.row - top, w, Role::Cursor);
+        }
+    }
+
+    fn draw_song(&mut self, s: &mut Screen) {
+        let c = self.cur();
+        if c.row < self.song_top {
+            self.song_top = c.row;
+        } else if c.row >= self.song_top + VISIBLE {
+            self.song_top = c.row + 1 - VISIBLE;
+        }
+        let top = self.song_top;
+        s.text(0, 0, "SONG", Role::Title);
+        for (t, &(x, _)) in SONG_GEOM.iter().enumerate() {
+            s.text(x, 2, &format!("{}", t + 1), Role::Info);
+        }
+        let pos = self.positions();
+        for i in 0..VISIBLE {
+            let r = top + i;
+            let y = GRID_Y + i;
+            s.text(0, y, &format!("{r:02X}"), row_role(r));
+            for t in 0..TRACKS {
+                let v = self.song.rows[r][t];
+                let playing = pos[t].is_some_and(|p| p.row == r);
+                if playing {
+                    s.text(SONG_GEOM[t].0 - 1, y, ">", Role::PlayMarker);
+                }
+                let role = if playing {
+                    Role::PlayMarker
+                } else if v == EMPTY {
+                    Role::Empty
+                } else {
+                    Role::Value
+                };
+                s.text(SONG_GEOM[t].0, y, &hex_or(v, "--"), role);
+            }
+        }
+        self.grid_overlay(s, &SONG_GEOM, top);
+    }
+
+    fn draw_chain(&self, s: &mut Screen) {
+        s.text(0, 0, &format!("CHAIN {:02X}", self.chain), Role::Title);
+        s.text(3, 2, "PH", Role::Info);
+        s.text(6, 2, "TSP", Role::Info);
+        let pos = self.positions();
+        for i in 0..STEPS {
+            let y = GRID_Y + i;
+            let st = self.song.chains[self.chain].steps[i];
+            s.text(0, y, &format!("{i:X}"), row_role(i));
+            if pos
+                .iter()
+                .flatten()
+                .any(|p| p.chain == self.chain && p.chain_step == i)
+            {
+                s.text(1, y, ">", Role::PlayMarker);
+            }
+            let empty = st.phrase == EMPTY;
+            s.text(
+                3,
+                y,
+                &hex_or(st.phrase, "--"),
+                if empty { Role::Empty } else { Role::Value },
+            );
+            s.text(
+                6,
+                y,
+                &format!("{:02X}", st.transpose),
+                if empty { Role::Empty } else { Role::Value },
+            );
+        }
+        self.grid_overlay(s, &CHAIN_GEOM, 0);
+    }
+
+    fn draw_phrase(&self, s: &mut Screen) {
+        s.text(0, 0, &format!("PHRASE {:02X}", self.phrase), Role::Title);
+        for (x, label) in [
+            (2, "N"),
+            (6, "V"),
+            (9, "I"),
+            (12, "FX1"),
+            (19, "FX2"),
+            (26, "FX3"),
+        ] {
+            s.text(x, 2, label, Role::Info);
+        }
+        let pos = self.positions();
+        let ctx_track = self.phrase_ctx.map(|c| c.track);
+        for i in 0..STEPS {
+            let y = GRID_Y + i;
+            let st = &self.song.phrases[self.phrase].steps[i];
+            s.text(0, y, &format!("{i:X}"), row_role(i));
+            let here = pos.iter().enumerate().any(|(t, p)| {
+                p.is_some_and(|p| p.phrase == self.phrase && p.phrase_step == i)
+                    && (ctx_track.is_none() || ctx_track == Some(t))
+            });
+            if here {
+                s.text(1, y, ">", Role::PlayMarker);
+            }
+            let note_role = if st.note == EMPTY {
+                Role::Empty
+            } else {
+                Role::Value
+            };
+            s.text(2, y, &note_name(st.note), note_role);
+            let vol_role = if st.volume == EMPTY {
+                Role::Empty
+            } else {
+                Role::Value
+            };
+            s.text(6, y, &hex_or(st.volume, "--"), vol_role);
+            let inst_role = if st.instrument == EMPTY {
+                Role::Empty
+            } else {
+                Role::Value
+            };
+            s.text(9, y, &hex_or(st.instrument, "--"), inst_role);
+            for (k, fx) in st.fx.iter().enumerate() {
+                let (cx, vx) = (PHRASE_GEOM[3 + 2 * k].0, PHRASE_GEOM[4 + 2 * k].0);
+                draw_fx(s, cx, vx, y, fx.command, fx.value);
+            }
+        }
+        self.grid_overlay(s, &PHRASE_GEOM, 0);
+    }
+
+    fn draw_table(&self, s: &mut Screen) {
+        s.text(0, 0, &format!("TABLE {:02X}", self.table), Role::Title);
+        for (x, label) in [(2, "N"), (5, "V"), (8, "FX1"), (15, "FX2"), (22, "FX3")] {
+            s.text(x, 2, label, Role::Info);
+        }
+        for i in 0..STEPS {
+            let y = GRID_Y + i;
+            let st = &self.song.tables[self.table].steps[i];
+            s.text(0, y, &format!("{i:X}"), row_role(i));
+            let tsp_role = if st.transpose == 0 {
+                Role::Empty
+            } else {
+                Role::Value
+            };
+            s.text(2, y, &format!("{:02X}", st.transpose), tsp_role);
+            let vol_role = if st.volume == EMPTY {
+                Role::Empty
+            } else {
+                Role::Value
+            };
+            s.text(5, y, &hex_or(st.volume, "--"), vol_role);
+            for (k, fx) in st.fx.iter().enumerate() {
+                let (cx, vx) = (TABLE_GEOM[2 + 2 * k].0, TABLE_GEOM[3 + 2 * k].0);
+                draw_fx(s, cx, vx, y, fx.command, fx.value);
+            }
+        }
+        self.grid_overlay(s, &TABLE_GEOM, 0);
+    }
+
+    fn draw_groove(&self, s: &mut Screen) {
+        s.text(0, 0, &format!("GROOVE {:02X}", self.groove), Role::Title);
+        let g = &self.song.grooves[self.groove];
+        for i in 0..STEPS {
+            let y = GRID_Y + i;
+            s.text(0, y, &format!("{i:X}"), row_role(i));
+            let v = g.steps[i];
+            let role = if v == EMPTY { Role::Empty } else { Role::Value };
+            s.text(2, y, &hex_or(v, "--"), role);
+        }
+        let ticks: u32 = g.ticks().iter().map(|&t| t as u32).sum();
+        let per_phrase = if g.ticks().is_empty() {
+            96
+        } else {
+            (0..STEPS)
+                .map(|i| g.ticks()[i % g.ticks().len()] as u32)
+                .sum()
+        };
+        s.text(
+            0,
+            20,
+            &format!("{ticks} TICKS, {per_phrase} PER PHRASE"),
+            Role::Info,
+        );
+        self.grid_overlay(s, &GROOVE_GEOM, 0);
+    }
+
+    fn draw_instrument(&mut self, s: &mut Screen) {
+        let n = self.instrument;
+        let inst = self.song.instruments[n as usize].clone();
+        s.text(0, 0, &format!("INST. {n:02X}"), Role::Title);
+        let kind = match inst.kind {
+            InstrumentKind::None => "NONE".to_string(),
+            k => k.name().to_uppercase(),
+        };
+        let plugin = match self.slot(n) {
+            Some(slot) => slot.plugin.descriptor.name.clone(),
+            None => match self.missing.iter().find(|m| m.0 == n) {
+                Some((_, why)) => format!("! {why}"),
+                None => "--".into(),
+            },
+        };
+        let own = self.map.numbered().any(|x| x == n);
+        let plugin = if self.slot(n).is_some() && !own {
+            format!("{plugin} (MAP)")
+        } else {
+            plugin
+        };
+        let name = if inst.name.is_empty() {
+            "--------".into()
+        } else {
+            inst.name.clone()
+        };
+        let fields = [
+            ("TYPE", kind),
+            ("NAME", name),
+            ("PLUGIN", plugin),
+            ("TRANSP.", if inst.transpose { "ON" } else { "OFF" }.into()),
+            ("TBL. TIC", format!("{:02X}", inst.table_tick)),
+        ];
+        let c = self.cur();
+        for (i, (label, value)) in fields.iter().enumerate() {
+            let y = 2 + i;
+            s.text(0, y, label, Role::Default);
+            let v: String = value.chars().take(PANEL_X - 10).collect();
+            s.text(9, y, &v, Role::Value);
+            if c.row == i {
+                s.highlight(9, y, v.chars().count().max(2), Role::Cursor);
+            }
+        }
+        if self.params.is_empty() {
+            let msg = if self.slot(n).is_some() {
+                "NO PARAMETERS"
+            } else {
+                "EDIT ON PLUGIN TO CHOOSE ONE"
+            };
+            s.text(0, 8, msg, Role::Info);
+            return;
+        }
+        s.text(
+            0,
+            8,
+            &format!("PARAMETERS ({})", self.params.len()),
+            Role::Info,
+        );
+        let visible = 11;
+        if c.row >= INST_FIELDS {
+            let i = c.row - INST_FIELDS;
+            if i < self.inst_top {
+                self.inst_top = i;
+            } else if i >= self.inst_top + visible {
+                self.inst_top = i + 1 - visible;
+            }
+        }
+        let params = self.params.clone();
+        for (k, p) in params.iter().enumerate().skip(self.inst_top).take(visible) {
+            let y = 9 + k - self.inst_top;
+            let label: String = p.name.to_uppercase().chars().take(16).collect();
+            s.text(0, y, &label, Role::Default);
+            let v = self.param_value(p);
+            let text = self
+                .slot(n)
+                .and_then(|sl| sl.plugin.value_to_text(p.id, v))
+                .unwrap_or_else(|| format!("{v:.2}"));
+            let text: String = text.chars().take(PANEL_X - 18).collect();
+            let role = if p.is_readonly() {
+                Role::Info
+            } else {
+                Role::Value
+            };
+            s.text(17, y, &text, role);
+            if c.row == INST_FIELDS + k {
+                s.highlight(17, y, text.chars().count().max(2), Role::Cursor);
+            }
+        }
+    }
+
+    fn draw_project(&self, s: &mut Screen) {
+        s.text(0, 0, "PROJECT", Role::Title);
+        let c = self.cur();
+        let device = self
+            .audio
+            .device
+            .clone()
+            .unwrap_or_else(|| "DEFAULT".into());
+        let or_default = |v: Option<u32>| v.map_or("DEFAULT".to_string(), |v| v.to_string());
+        let tempo = if self.song.tempo.fract() == 0.0 {
+            format!("{:.0}", self.song.tempo)
+        } else {
+            format!("{:.2}", self.song.tempo)
+        };
+        let values = [
+            tempo,
+            format!("{:02X}", self.song.transpose),
+            if self.song.name.is_empty() {
+                "--------".into()
+            } else {
+                self.song.name.clone()
+            },
+            String::new(),
+            format!("{} S", self.render_seconds),
+            device,
+            or_default(self.audio.sample_rate),
+            or_default(self.audio.buffer_size),
+            "RESTART AUDIO".into(),
+        ];
+        s.text(0, 9, "AUDIO OUTPUT", Role::Info);
+        for (i, ((label, y), v)) in PROJECT_FIELDS.iter().zip(values.iter()).enumerate() {
+            s.text(0, *y, label, Role::Default);
+            if i == 3 {
+                for (k, a) in ["SAVE", "LOAD", "NEW"].iter().enumerate() {
+                    let x = 11 + k * 6;
+                    s.text(x, *y, a, Role::Value);
+                    if c.row == 3 && self.project_col == k {
+                        s.highlight(x, *y, a.len(), Role::Cursor);
+                    }
+                }
+                continue;
+            }
+            let v: String = v.chars().take(PANEL_X - 12).collect();
+            s.text(11, *y, &v, Role::Value);
+            if c.row == i {
+                s.highlight(11, *y, v.chars().count().max(2), Role::Cursor);
+            }
+        }
+        let file = self
+            .path
+            .as_ref()
+            .map_or("NOT SAVED YET".into(), |p| file_name(p));
+        let mark = if self.unsaved { "*" } else { "" };
+        s.text(0, 16, &format!("FILE {file}{mark}"), Role::Info);
+        if let Some(r) = &self.rack {
+            s.text(
+                0,
+                17,
+                &format!("{} HZ, {}", r.sample_rate, r.output_name),
+                Role::Info,
+            );
+        }
+        if let Some(p) = &self.audio_problem {
+            s.text(0, 18, &format!("SOUND CARD FAILED: {p}"), Role::Info);
+        }
+    }
+
+    /// Meters, tempo, per-track notes and the mini-map on the right.
+    fn draw_panel(&self, s: &mut Screen) {
+        let x = PANEL_X;
+        let db = 20.0 * self.meter.max(1e-6).log10();
+        let width = 7;
+        let filled = (((db + 48.0) / 48.0).clamp(0.0, 1.0) * width as f32).round() as usize;
+        for i in 0..width {
+            let role = if i >= filled {
+                Role::Empty
+            } else if i >= 6 {
+                Role::MeterPeak
+            } else if i >= 4 {
+                Role::MeterMid
+            } else {
+                Role::MeterLow
+            };
+            s.text(x + i, 0, "\u{2588}", role);
+        }
+        let tempo = self
+            .rack
+            .as_ref()
+            .map_or(self.song.tempo, |r| r.shared.tempo());
+        s.text(x, 1, &format!("{tempo:>7.1}"), Role::Value);
+        for t in 0..TRACKS {
+            let y = 3 + t;
+            let bit = 1 << t;
+            let silenced = self.muted & bit != 0 || (self.soloed != 0 && self.soloed & bit == 0);
+            s.text(
+                x,
+                y,
+                &format!("{}", t + 1),
+                if silenced { Role::Empty } else { Role::Info },
+            );
+            let note = self.rack.as_ref().and_then(|r| r.shared.track(t).note);
+            match note {
+                Some((n, _)) if !silenced => s.text(x + 2, y, &note_name(n), Role::Value),
+                _ => s.text(x + 2, y, "---", Role::Empty),
+            }
+            if self.soloed & bit != 0 {
+                s.text(x + 6, y, "S", Role::Title);
+            } else if self.muted & bit != 0 {
+                s.text(x + 6, y, "M", Role::Info);
+            }
+        }
+        for &(ch, mx, my, view) in MAP {
+            let role = match view {
+                Some(v) if v == self.view => Role::Title,
+                Some(_) => Role::Default,
+                None => Role::Empty,
+            };
+            s.text(x + mx, 19 + my, &ch.to_string(), role);
+        }
+    }
+
+    fn draw_status(&self, s: &mut Screen) {
+        if let Some(Modal::Text { label, value, .. }) = &self.modal {
+            s.text(0, ROWS - 1, &format!("{label}: {value}_"), Role::Title);
+            return;
+        }
+        if let Some((msg, at)) = &self.status {
+            if at.elapsed() < Duration::from_secs(3) {
+                s.text(0, ROWS - 1, &msg.to_uppercase(), Role::Info);
+            }
+        }
+    }
+}
+
+fn cycle<T: Clone + PartialEq>(opts: &[T], cur: &T, delta: i32) -> T {
+    let i = opts.iter().position(|o| o == cur).unwrap_or(0) as i32;
+    opts[(i + delta.signum()).rem_euclid(opts.len() as i32) as usize].clone()
+}
+
+fn kind_name(k: Kind) -> &'static str {
+    match k {
+        Kind::Chain => "CHAIN",
+        Kind::Phrase => "PHRASE",
+        _ => "INSTRUMENT",
+    }
+}
+
+fn row_role(r: usize) -> Role {
+    if r % 4 == 0 {
+        Role::Default
+    } else {
+        Role::Info
+    }
+}
+
+fn hex_or(v: u8, empty: &str) -> String {
+    if v == EMPTY {
+        empty.to_string()
+    } else {
+        format!("{v:02X}")
+    }
+}
+
+fn draw_fx(s: &mut Screen, cx: usize, vx: usize, y: usize, cmd: u8, val: u8) {
+    if cmd == EMPTY {
+        s.text(cx, y, "---", Role::Empty);
+        s.text(vx, y, "00", Role::Empty);
+    } else {
+        s.text(cx, y, &fx_name(cmd), Role::Value);
+        s.text(vx, y, &format!("{val:02X}"), Role::Value);
+    }
+}
+
+fn draw_list(s: &mut Screen, title: &str, rows: &[(String, String)], cur: usize) {
+    s.text(0, 0, title, Role::Title);
+    let visible = 18;
+    let top = cur.saturating_sub(visible - 1);
+    for (i, (name, detail)) in rows.iter().enumerate().skip(top).take(visible) {
+        let y = 2 + i - top;
+        let name: String = name.to_uppercase().chars().take(26).collect();
+        s.text(0, y, &name, Role::Value);
+        let detail: String = detail.to_uppercase().chars().take(12).collect();
+        s.text(27, y, &detail, Role::Info);
+        if i == cur {
+            s.highlight(0, y, name.chars().count().max(2), Role::Cursor);
+        }
+    }
+    s.text(0, 21, "EDIT CHOOSES, OPTION GOES BACK", Role::Info);
+}
+
+fn file_name(p: &std::path::Path) -> String {
+    p.file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app() -> App {
+        let mut a = App {
+            song: Song::new_empty(),
+            path: None,
+            map: InstrumentMap::default(),
+            slots: Vec::new(),
+            missing: Vec::new(),
+            rack: None,
+            use_device: false,
+            audio: AudioSettings::default(),
+            note_offset: 24,
+            audio_problem: None,
+            view: View::Song,
+            cursors: HashMap::new(),
+            song_top: 0,
+            chain: 0,
+            chain_ctx: None,
+            phrase: 0,
+            phrase_ctx: None,
+            instrument: 0,
+            inst_top: 0,
+            table: 0,
+            groove: 0,
+            project_col: 0,
+            render_seconds: 60,
+            devices: Vec::new(),
+            last: HashMap::new(),
+            last_edit: None,
+            selection: None,
+            clip: None,
+            modal: None,
+            confirm: None,
+            status: None,
+            preview: None,
+            param_hold: HashMap::new(),
+            params: Vec::new(),
+            params_for: None,
+            muted: 0,
+            soloed: 0,
+            meter: 0.0,
+            dirty: false,
+            unsaved: false,
+            keys: Keys::default(),
+            quit: false,
+        };
+        a.dirty = false;
+        a
+    }
+
+    fn tap(a: &mut App, b: Button) {
+        a.press(Press::new(b));
+    }
+
+    fn with(a: &mut App, b: Button, f: impl FnOnce(&mut super::super::input::Held)) {
+        a.press(Press::with(b, f));
+    }
+
+    #[test]
+    fn write_a_song_from_scratch() {
+        let mut a = app();
+        // Song: EDIT inserts chain 00, double tap makes a new one.
+        tap(&mut a, Button::Edit);
+        assert_eq!(a.song.rows[0][0], 0);
+        tap(&mut a, Button::Right);
+        tap(&mut a, Button::Edit);
+        tap(&mut a, Button::Edit);
+        assert_eq!(
+            a.song.rows[0][1], 1,
+            "chain 00 is in use, so the new one is 01"
+        );
+        // A single EDIT repeats the last chain.
+        a.last_edit = None;
+        a.set_cur(Cursor { row: 1, col: 0 });
+        tap(&mut a, Button::Edit);
+        assert_eq!(a.song.rows[1][0], 1);
+
+        // Into chain 00: a phrase, transposed up 5.
+        a.set_cur(Cursor { row: 0, col: 0 });
+        with(&mut a, Button::Right, |h| h.shift = true);
+        assert_eq!(a.view, View::Chain);
+        tap(&mut a, Button::Edit);
+        assert_eq!(a.song.chains[0].steps[0].phrase, 0);
+        tap(&mut a, Button::Right);
+        for _ in 0..5 {
+            with(&mut a, Button::Right, |h| h.edit = true);
+        }
+        assert_eq!(a.song.chains[0].steps[0].transpose, 5);
+
+        // Into the phrase: a note with its instrument, then an octave up.
+        tap(&mut a, Button::Left);
+        with(&mut a, Button::Right, |h| h.shift = true);
+        assert_eq!(a.view, View::Phrase);
+        tap(&mut a, Button::Edit);
+        let st = a.song.phrases[0].steps[0];
+        assert_eq!((st.note, st.instrument), (36, 0));
+        with(&mut a, Button::Up, |h| h.edit = true);
+        assert_eq!(a.song.phrases[0].steps[0].note, 48);
+        // The next note reuses the last value.
+        tap(&mut a, Button::Down);
+        tap(&mut a, Button::Edit);
+        assert_eq!(a.song.phrases[0].steps[1].note, 48);
+        // Delete clears it, and deleting again writes OFF.
+        with(&mut a, Button::Option, |h| h.edit = true);
+        assert_eq!(a.song.phrases[0].steps[1].note, EMPTY);
+        with(&mut a, Button::Option, |h| h.edit = true);
+        assert_eq!(a.song.phrases[0].steps[1].note, 0x80);
+
+        // An effect: EDIT on FX1 inserts ARP 00, EDIT+RIGHT moves to CHA.
+        a.set_cur(Cursor { row: 0, col: 3 });
+        tap(&mut a, Button::Edit);
+        assert_eq!(a.song.phrases[0].steps[0].fx[0].command, 0);
+        with(&mut a, Button::Right, |h| h.edit = true);
+        assert_eq!(a.song.phrases[0].steps[0].fx[0].command, 1);
+
+        // Back to the song with SHIFT+LEFT twice.
+        with(&mut a, Button::Left, |h| h.shift = true);
+        with(&mut a, Button::Left, |h| h.shift = true);
+        assert_eq!(a.view, View::Song);
+        assert!(a.unsaved);
+    }
+
+    #[test]
+    fn copy_and_paste_in_the_song() {
+        let mut a = app();
+        a.song.rows[0][0] = 3;
+        a.song.rows[1][0] = 4;
+        with(&mut a, Button::Option, |h| h.shift = true);
+        tap(&mut a, Button::Down);
+        tap(&mut a, Button::Option);
+        assert!(a.selection.is_none());
+        a.set_cur(Cursor { row: 5, col: 2 });
+        with(&mut a, Button::Edit, |h| h.shift = true);
+        assert_eq!((a.song.rows[5][2], a.song.rows[6][2]), (3, 4));
+        // Cut empties the source.
+        a.set_cur(Cursor { row: 5, col: 2 });
+        with(&mut a, Button::Option, |h| h.shift = true);
+        with(&mut a, Button::Option, |h| h.edit = true);
+        assert_eq!(a.song.rows[5][2], EMPTY);
+    }
+
+    #[test]
+    fn clone_a_phrase() {
+        let mut a = app();
+        a.song.chains[0].steps[0].phrase = 0;
+        a.song.phrases[0].steps[0].note = 40;
+        a.song.rows[0][0] = 0;
+        a.view = View::Chain;
+        with(&mut a, Button::Option, |h| h.shift = true);
+        with(&mut a, Button::Edit, |h| h.shift = true);
+        let p = a.song.chains[0].steps[0].phrase;
+        assert_ne!(p, 0);
+        assert_eq!(a.song.phrases[p as usize].steps[0].note, 40);
+    }
+
+    #[test]
+    fn views_draw() {
+        let mut a = app();
+        a.song.rows[0][0] = 0;
+        a.song.chains[0].steps[0].phrase = 0;
+        a.song.phrases[0].steps[0] = crate::m8::format::PhraseStep {
+            note: 36,
+            volume: 0x40,
+            instrument: 1,
+            fx: [crate::m8::format::Fx {
+                command: 5,
+                value: 2,
+            }; 3],
+        };
+        for v in [
+            View::Song,
+            View::Chain,
+            View::Phrase,
+            View::Instrument,
+            View::Table,
+            View::Groove,
+            View::Project,
+        ] {
+            a.view = v;
+            let mut s = Screen::new();
+            a.draw(&mut s);
+        }
+        a.view = View::Phrase;
+        let mut s = Screen::new();
+        a.draw(&mut s);
+        assert_eq!(&s.row(0)[..9], "PHRASE 00");
+        assert_eq!(&s.row(3)[..18], "0 C-4 40 01 KIL 02");
+    }
+}
