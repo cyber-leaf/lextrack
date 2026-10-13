@@ -155,6 +155,14 @@ impl InstrumentMap {
         Ok(())
     }
 
+    /// Every plugin the map names.
+    pub fn plugins(&self) -> impl Iterator<Item = &PluginRef> + '_ {
+        self.by_number
+            .values()
+            .chain(self.by_kind.values())
+            .chain(self.default.iter())
+    }
+
     /// Instrument numbers with a plugin of their own.
     pub fn numbered(&self) -> impl Iterator<Item = u8> + '_ {
         self.by_number.keys().copied()
