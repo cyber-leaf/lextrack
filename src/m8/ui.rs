@@ -293,6 +293,8 @@ pub struct App {
     param_hold: HashMap<(u8, u32), (f64, Instant)>,
     params: Vec<ParamInfo>,
     params_for: Option<(u8, usize)>,
+    /// Installed plugins, scanned the first time they're needed.
+    installed: Option<Vec<PluginDescriptor>>,
     muted: u8,
     soloed: u8,
     meter: f32,
@@ -340,6 +342,7 @@ impl App {
             param_hold: HashMap::new(),
             params: Vec::new(),
             params_for: None,
+            installed: None,
             muted: 0,
             soloed: 0,
             meter: 0.0,
@@ -1341,6 +1344,7 @@ impl App {
                 })
             }
             2 if delta == 0 => self.open_plugin_browser(n),
+            2 => self.step_plugin(n, delta),
             3 if delta != 0 => {
                 inst.transpose = !inst.transpose;
                 self.changed();
@@ -1423,17 +1427,94 @@ impl App {
         self.unsaved = true;
     }
 
+    /// Every plugin in the standard CLAP folders and `$CLAP_PATH`, plus the
+    /// ones the instrument map names wherever they are.
+    fn installed_plugins(&mut self) -> Vec<PluginDescriptor> {
+        if let Some(list) = &self.installed {
+            return list.clone();
+        }
+        let mut files = Vec::new();
+        for dir in crate::discovery::search_paths() {
+            crate::discovery::find_clap_files(&dir, &mut files);
+        }
+        files.extend(self.map.plugins().map(|p| p.path.clone()));
+        files.sort();
+        files.dedup();
+        let scan = crate::discovery::scan_files(&files);
+        let mut list = scan.plugins;
+        list.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then(a.path.cmp(&b.path))
+        });
+        list.dedup_by(|a, b| a.path == b.path && a.id == b.id);
+        if !scan.errors.is_empty() {
+            self.flash(format!(
+                "{} PLUGIN FILE(S) FAILED TO LOAD",
+                scan.errors.len()
+            ));
+        }
+        self.installed = Some(list.clone());
+        list
+    }
+
+    /// Position of the instrument's current plugin in `list`.
+    fn current_plugin(&self, instrument: u8, list: &[PluginDescriptor]) -> Option<usize> {
+        let src = &self.slot(instrument)?.source;
+        list.iter()
+            .position(|d| d.path == src.path && src.id.as_ref().map_or(true, |id| *id == d.id))
+    }
+
     fn open_plugin_browser(&mut self, instrument: u8) {
-        self.flash("SCANNING PLUGINS...");
-        let scan = crate::discovery::scan_default();
-        if scan.plugins.is_empty() {
+        // Scan again each time, so newly installed plugins show up.
+        self.installed = None;
+        let list = self.installed_plugins();
+        if list.is_empty() {
             return self.flash("NO CLAP PLUGINS FOUND");
         }
+        let cur = self.current_plugin(instrument, &list).unwrap_or(0);
         self.modal = Some(Modal::Plugins {
             instrument,
-            list: scan.plugins,
-            cur: 0,
+            list,
+            cur,
         });
+    }
+
+    /// EDIT+LEFT/RIGHT on PLUGIN: the previous or next installed plugin.
+    fn step_plugin(&mut self, instrument: u8, delta: i32) {
+        let list = self.installed_plugins();
+        if list.is_empty() {
+            return self.flash("NO CLAP PLUGINS FOUND");
+        }
+        let i = match self.current_plugin(instrument, &list) {
+            Some(i) => (i as i32 + delta.signum()).rem_euclid(list.len() as i32) as usize,
+            None if delta > 0 => 0,
+            None => list.len() - 1,
+        };
+        self.choose_plugin(instrument, &list[i]);
+    }
+
+    /// Give `instrument` its own plugin.
+    fn choose_plugin(&mut self, instrument: u8, d: &PluginDescriptor) {
+        self.map.set_number(
+            instrument,
+            Some(PluginRef {
+                path: d.path.clone(),
+                id: Some(d.id.clone()),
+            }),
+        );
+        self.map.states.remove(&instrument);
+        let inst = &mut self.song.instruments[instrument as usize];
+        if inst.kind == InstrumentKind::None {
+            inst.kind = InstrumentKind::Wavsynth;
+        }
+        if inst.name.is_empty() {
+            inst.name = d.name.to_uppercase().chars().take(12).collect();
+        }
+        self.changed();
+        self.rebuild_audio();
+        self.flash(format!("{} ON {instrument:02X}", d.name));
     }
 
     // --- project view -----------------------------------------------------------
@@ -1670,27 +1751,7 @@ impl App {
                 instrument,
                 list,
                 cur,
-            }) => {
-                let d = &list[cur];
-                self.map.set_number(
-                    instrument,
-                    Some(PluginRef {
-                        path: d.path.clone(),
-                        id: Some(d.id.clone()),
-                    }),
-                );
-                self.map.states.remove(&instrument);
-                let inst = &mut self.song.instruments[instrument as usize];
-                if inst.kind == InstrumentKind::None {
-                    inst.kind = InstrumentKind::Wavsynth;
-                }
-                if inst.name.is_empty() {
-                    inst.name = d.name.to_uppercase().chars().take(12).collect();
-                }
-                self.changed();
-                self.rebuild_audio();
-                self.flash(format!("{} ON {instrument:02X}", d.name));
-            }
+            }) => self.choose_plugin(instrument, &list[cur]),
             Some(Modal::Songs { list, cur, .. }) => {
                 let p = list[cur].clone();
                 if p.is_dir() {
@@ -2006,7 +2067,7 @@ impl App {
         };
         let own = self.map.numbered().any(|x| x == n);
         let plugin = if self.slot(n).is_some() && !own {
-            format!("{plugin} (MAP)")
+            format!("{plugin} (DEF)")
         } else {
             plugin
         };
@@ -2031,6 +2092,9 @@ impl App {
             if c.row == i {
                 s.highlight(9, y, v.chars().count().max(2), Role::Cursor);
             }
+        }
+        if c.row == 2 {
+            s.text(0, 7, "EDIT: LIST, EDIT+L/R: NEXT", Role::Info);
         }
         if self.params.is_empty() {
             let msg = if self.slot(n).is_some() {
@@ -2316,6 +2380,7 @@ mod tests {
             param_hold: HashMap::new(),
             params: Vec::new(),
             params_for: None,
+            installed: None,
             muted: 0,
             soloed: 0,
             meter: 0.0,

@@ -101,7 +101,7 @@ LSCPIT       L  live          S  song          C  chain    P  phrase
 - **SONG**: eight tracks of chain numbers, 256 rows. SHIFT+RIGHT opens the chain under the cursor.
 - **CHAIN**: up to 16 phrases (PH) with a transpose each (TSP). SHIFT+RIGHT opens the phrase.
 - **PHRASE**: 16 steps of note (N), volume (V), instrument (I) and three effects. SHIFT+RIGHT opens the step's instrument; SHIFT+UP opens the groove.
-- **INSTRUMENT**: the M8 type, name, transpose setting and table tick, and the CLAP plugin that plays it. EDIT on PLUGIN opens a list of installed plugins; EDIT+OPTION there removes the instrument's own choice. Below are the plugin's parameters, changed with EDIT+arrows and reset with EDIT+OPTION. SHIFT+RIGHT opens the instrument's table.
+- **INSTRUMENT**: the M8 type, name, transpose setting and table tick, and the CLAP plugin that plays it. Every instrument can use any installed plugin: EDIT on PLUGIN opens the list of installed plugins (the standard CLAP folders, `$CLAP_PATH`, and any plugin named on the command line or in the map), EDIT+LEFT/RIGHT steps through them, and EDIT+OPTION goes back to the shared default. `(DEF)` after a plugin name means the instrument uses the shared default. Below are the plugin's parameters, changed with EDIT+arrows and reset with EDIT+OPTION. SHIFT+RIGHT opens the instrument's table.
 - **TABLE**: 16 steps of transpose, volume and three effects (edited and saved, but not played yet).
 - **GROOVE**: the ticks per step, with the total per phrase (96 is straight time).
 - **PROJECT**: tempo, transpose, name, SAVE / LOAD / NEW (press EDIT twice to drop unsaved changes), RENDER to a WAV file, and the audio output: device, sample rate and buffer size. APPLY restarts audio with them and saves them for next time.
