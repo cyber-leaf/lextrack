@@ -17,6 +17,7 @@ macro_rules! cptr {
 
 mod discovery;
 mod engine;
+mod m8;
 mod notes;
 mod plugin;
 mod settings;
@@ -39,6 +40,7 @@ lextrack: a terminal host for CLAP plugins
 
 USAGE:
     lextrack [OPTIONS] [PLUGIN.clap]
+    lextrack m8 SONG.m8s [OPTIONS]    Play an M8 song (see lextrack m8 --help)
 
 With no plugin path, lextrack scans the standard CLAP folders and lets you pick.
 
@@ -157,6 +159,10 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    let mut raw = std::env::args_os().skip(1).peekable();
+    if raw.peek().is_some_and(|a| a == "m8") {
+        return m8::app::run(raw.skip(1));
+    }
     let args = parse_args()?;
 
     if args.list_devices {

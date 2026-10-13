@@ -1,0 +1,10 @@
+lextrack includes material from m8-js
+(https://github.com/whitlockjc/m8-js), Copyright 2022 Jeremy Whitlock,
+licensed under the Apache License 2.0 (see third_party/m8-js/LICENSE):
+
+- src/m8/format.rs is a Rust port of m8-js's M8 song reader (loadSong,
+  loadInstrument, loadTable and M8FileReader), changed to read only the
+  data playback needs.
+- tests/fixtures/DEFAULT.m8s and tests/fixtures/TESTING.m8s are copied
+  unchanged from m8-js's test files. examples/demo.m8s is generated from
+  DEFAULT.m8s by examples/make_demo_song.py.
