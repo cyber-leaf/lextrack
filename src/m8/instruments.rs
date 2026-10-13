@@ -54,18 +54,6 @@ impl PluginRef {
         };
         Ok(PluginRef { path, id })
     }
-
-    pub fn label(&self) -> String {
-        let file = self
-            .path
-            .file_name()
-            .map(|f| f.to_string_lossy().into_owned())
-            .unwrap_or_else(|| self.path.display().to_string());
-        match &self.id {
-            Some(id) => format!("{file}@{id}"),
-            None => file,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -73,6 +61,8 @@ pub struct InstrumentMap {
     by_number: HashMap<u8, PluginRef>,
     by_kind: HashMap<String, PluginRef>,
     default: Option<PluginRef>,
+    /// Saved plugin settings (`clap.state`) per instrument number.
+    pub states: HashMap<u8, Vec<u8>>,
 }
 
 const KINDS: &[&str] = &["wavsynth", "macrosynth", "sampler", "midiout", "fmsynth"];
@@ -91,10 +81,53 @@ impl InstrumentMap {
             let Some((key, value)) = line.split_once('=') else {
                 bail!("{}:{}: expected `key = plugin`", path.display(), n + 1);
             };
+            if let Some(num) = key.trim().strip_prefix("state ") {
+                let num = u8::from_str_radix(num.trim(), 16).ok();
+                let data = base64_decode(value.trim());
+                match (num, data) {
+                    (Some(num), Some(data)) => map.states.insert(num, data),
+                    _ => bail!("{}:{}: bad plugin state line", path.display(), n + 1),
+                };
+                continue;
+            }
             map.set(key, value, base)
                 .with_context(|| format!("{}:{}", path.display(), n + 1))?;
         }
         Ok(map)
+    }
+
+    /// Write the rules and plugin states, with absolute paths.
+    pub fn save(&self, path: &Path, song_name: &str) -> Result<()> {
+        let mut out = format!(
+            "# lextrack instruments for {song_name}: which CLAP plugin plays each\n\
+             # M8 instrument, and the plugins' saved settings.\n"
+        );
+        let line = |key: &str, p: &PluginRef| {
+            let path = p.path.display();
+            match &p.id {
+                Some(id) => format!("{key} = {path}@{id}\n"),
+                None => format!("{key} = {path}\n"),
+            }
+        };
+        let mut nums: Vec<_> = self.by_number.iter().collect();
+        nums.sort_by_key(|(n, _)| **n);
+        for (n, p) in nums {
+            out += &line(&format!("{n:02X}"), p);
+        }
+        let mut kinds: Vec<_> = self.by_kind.iter().collect();
+        kinds.sort_by(|a, b| a.0.cmp(b.0));
+        for (k, p) in kinds {
+            out += &line(k, p);
+        }
+        if let Some(p) = &self.default {
+            out += &line("default", p);
+        }
+        let mut states: Vec<_> = self.states.iter().collect();
+        states.sort_by_key(|(n, _)| **n);
+        for (n, data) in states {
+            out += &format!("state {n:02X} = {}\n", base64_encode(data));
+        }
+        std::fs::write(path, out).with_context(|| format!("can't write {}", path.display()))
     }
 
     /// Add one rule. `key` is a hex instrument number, a kind name or
@@ -122,6 +155,19 @@ impl InstrumentMap {
         Ok(())
     }
 
+    /// Instrument numbers with a plugin of their own.
+    pub fn numbered(&self) -> impl Iterator<Item = u8> + '_ {
+        self.by_number.keys().copied()
+    }
+
+    /// Give one instrument its own plugin, or remove its own rule.
+    pub fn set_number(&mut self, n: u8, plugin: Option<PluginRef>) {
+        match plugin {
+            Some(p) => self.by_number.insert(n, p),
+            None => self.by_number.remove(&n),
+        };
+    }
+
     pub fn set_default(&mut self, plugin: PluginRef) {
         self.default = Some(plugin);
     }
@@ -141,6 +187,44 @@ impl InstrumentMap {
         }
         self.default.as_ref()
     }
+}
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(B64[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let mut acc = 0u32;
+    let mut bits = 0;
+    for c in text.bytes().filter(|&c| c != b'=') {
+        let v = B64.iter().position(|&x| x == c)? as u32;
+        acc = acc << 6 | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -185,6 +269,33 @@ mod tests {
         );
         assert!(m.set("80", "x.clap", base).is_err());
         assert!(m.set("bogus", "x.clap", base).is_err());
+    }
+
+    #[test]
+    fn base64_round_trips() {
+        for n in 0..10 {
+            let data: Vec<u8> = (0..n).map(|i| (i * 37 + 200) as u8).collect();
+            assert_eq!(base64_decode(&base64_encode(&data)).unwrap(), data);
+        }
+        assert_eq!(base64_encode(b"Man"), "TWFu");
+        assert_eq!(base64_encode(b"Ma"), "TWE=");
+    }
+
+    #[test]
+    fn saves_and_loads() {
+        let dir = std::env::temp_dir().join(format!("lextrack-map-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("song.lextrack");
+        let mut m = InstrumentMap::default();
+        m.set("03", "/p/a.clap@x.y", &dir).unwrap();
+        m.set("fmsynth", "/p/fm.clap", &dir).unwrap();
+        m.states.insert(3, vec![1, 2, 3, 250]);
+        m.save(&path, "SONG").unwrap();
+        let back = InstrumentMap::load(&path).unwrap();
+        assert_eq!(back.by_number, m.by_number);
+        assert_eq!(back.by_kind, m.by_kind);
+        assert_eq!(back.states, m.states);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

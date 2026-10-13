@@ -1,4 +1,4 @@
-//! lextrack: a terminal host for CLAP audio plugins.
+//! lextrack: an M8-style terminal tracker that plays CLAP plugins.
 
 /// `&'static CStr` from a string literal (C-string literals need Rust 1.77).
 #[allow(unused_macros)]
@@ -15,141 +15,21 @@ macro_rules! cptr {
     };
 }
 
+mod audio;
 mod discovery;
-mod engine;
 mod m8;
-mod notes;
 mod plugin;
 mod settings;
-mod ui;
 
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use anyhow::{bail, Context, Result};
-use ratatui::backend::CrosstermBackend;
+use anyhow::Result;
 use ratatui::crossterm::{execute, terminal};
-use ratatui::Terminal;
 
-use crate::plugin::{PluginDescriptor, PluginInstance, PluginLibrary};
-
-const USAGE: &str = "\
-lextrack: a terminal host for CLAP plugins
-
-USAGE:
-    lextrack [OPTIONS] [PLUGIN.clap]
-    lextrack m8 SONG.m8s [OPTIONS]    Play an M8 song (see lextrack m8 --help)
-
-With no plugin path, lextrack scans the standard CLAP folders and lets you pick.
-
-OPTIONS:
-    --id <ID>       Plugin id to load when a file contains several plugins
-    --index <N>     Same, by position (0-based)
-    --no-audio      Don't open a sound card; process silently instead
-    --device <NAME>       Audio output device (see --list-devices), or \"default\"
-    --sample-rate <HZ>    Sample rate, e.g. 48000, or \"default\"
-    --buffer <FRAMES>     Buffer size, e.g. 256, or \"default\"
-                    These override the saved settings for this run. Press F2
-                    in the app to change and save them.
-    --list-devices  List audio output devices and exit
-    --list          List installed plugins and exit
-    --dump          Print the plugin's parameters and exit (no UI)
-    -h, --help      Show this help
-
-KEYS:
-    Up/Down         Select a parameter       Left/Right   Change its value
-    Shift+Left/Right  Fine step              Ctrl+Left/Right  Coarse step
-    Home/End        Minimum/maximum          Del/Backspace  Default value
-    Enter           Type a value             /            Filter by name
-    PgUp/PgDn       Jump 10 rows             Tab          Show plugin log
-    F2 or Ctrl+O    Audio output settings
-    a s d f g h j k l ; '   Play white keys  w e t y u o p  Play black keys
-    z / x           Octave down / up         Space        Stop all notes
-    q / Esc         Quit
-";
-
-struct Args {
-    path: Option<PathBuf>,
-    id: Option<String>,
-    index: Option<usize>,
-    no_audio: bool,
-    device: Option<Option<String>>,
-    sample_rate: Option<Option<u32>>,
-    buffer: Option<Option<u32>>,
-    list_devices: bool,
-    list: bool,
-    dump: bool,
-}
-
-fn parse_args() -> Result<Args> {
-    let mut a = Args {
-        path: None,
-        id: None,
-        index: None,
-        no_audio: false,
-        device: None,
-        sample_rate: None,
-        buffer: None,
-        list_devices: false,
-        list: false,
-        dump: false,
-    };
-    let mut it = std::env::args_os().skip(1);
-    while let Some(arg) = it.next() {
-        match arg.to_str() {
-            Some("-h" | "--help") => {
-                print!("{USAGE}");
-                std::process::exit(0);
-            }
-            Some("--id") => {
-                a.id = Some(
-                    it.next()
-                        .context("--id needs a value")?
-                        .to_string_lossy()
-                        .into(),
-                )
-            }
-            Some("--index") => {
-                a.index = Some(
-                    it.next()
-                        .context("--index needs a value")?
-                        .to_string_lossy()
-                        .parse()?,
-                )
-            }
-            Some("--no-audio") => a.no_audio = true,
-            Some("--list-devices") => a.list_devices = true,
-            Some("--device") => {
-                let v = it.next().context("--device needs a name")?;
-                let v = v.to_string_lossy();
-                a.device = Some((v != "default").then(|| v.into_owned()));
-            }
-            Some("--sample-rate") => {
-                a.sample_rate = Some(number_or_default(it.next(), "--sample-rate")?)
-            }
-            Some("--buffer") => a.buffer = Some(number_or_default(it.next(), "--buffer")?),
-            Some("--list") => a.list = true,
-            Some("--dump") => a.dump = true,
-            Some(s) if s.starts_with('-') => bail!("unknown option {s}\n\n{USAGE}"),
-            _ => a.path = Some(PathBuf::from(arg)),
-        }
-    }
-    Ok(a)
-}
-
-fn number_or_default(v: Option<std::ffi::OsString>, flag: &str) -> Result<Option<u32>> {
-    let v = v.with_context(|| format!("{flag} needs a value"))?;
-    let v = v.to_string_lossy();
-    if v == "default" {
-        return Ok(None);
-    }
-    let n: u32 = v
-        .parse()
-        .with_context(|| format!("{flag} expects a number or \"default\", not \"{v}\""))?;
-    Ok(Some(n))
-}
+use crate::m8::input::RELEASE_EVENTS;
 
 fn main() {
     if let Err(e) = run() {
@@ -159,151 +39,16 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let mut raw = std::env::args_os().skip(1).peekable();
-    if raw.peek().is_some_and(|a| a == "m8") {
-        return m8::app::run(raw.skip(1));
+    let mut args = std::env::args_os().skip(1).peekable();
+    // `lextrack m8 ...` was the command before the tracker became the app.
+    if args.peek().is_some_and(|a| a == "m8") {
+        args.next();
     }
-    let args = parse_args()?;
-
-    if args.list_devices {
-        let default = engine::default_device_name();
-        let devices = engine::output_devices();
-        if devices.is_empty() {
-            println!("no audio output devices found");
-        }
-        for d in devices {
-            let mark = if Some(&d) == default.as_ref() {
-                "  (default)"
-            } else {
-                ""
-            };
-            println!("{d}{mark}");
-        }
-        if let Some(p) = settings::path() {
-            let s = settings::AudioSettings::load();
-            println!("\nsaved settings ({}):", p.display());
-            println!("  device      {}", s.device.as_deref().unwrap_or("default"));
-            println!(
-                "  sample rate {}",
-                s.sample_rate.map_or("default".into(), |r| r.to_string())
-            );
-            println!(
-                "  buffer      {}",
-                s.buffer_size.map_or("default".into(), |b| b.to_string())
-            );
-        }
-        return Ok(());
-    }
-
-    if args.list {
-        let scan = discovery::scan_default();
-        for p in &scan.plugins {
-            println!(
-                "{:<30} {:<20} {:<40} {}",
-                p.name,
-                p.vendor,
-                p.id,
-                p.path.display()
-            );
-        }
-        for e in &scan.errors {
-            eprintln!("skipped {e}");
-        }
-        if scan.plugins.is_empty() {
-            eprintln!("no CLAP plugins found in:");
-            for d in discovery::search_paths() {
-                eprintln!("  {}", d.display());
-            }
-        }
-        return Ok(());
-    }
-
-    // Work out which plugins are candidates.
-    let candidates: Vec<PluginDescriptor> = match &args.path {
-        Some(path) => PluginLibrary::load(path)?.descriptors()?,
-        None => {
-            let scan = discovery::scan_default();
-            if scan.plugins.is_empty() {
-                let dirs: Vec<String> = discovery::search_paths()
-                    .iter()
-                    .map(|d| d.display().to_string())
-                    .collect();
-                bail!(
-                    "no CLAP plugins found. Pass a path to a .clap file, or install plugins in: {}",
-                    dirs.join(", ")
-                );
-            }
-            scan.plugins
-        }
-    };
-    if candidates.is_empty() {
-        bail!("that file contains no plugins");
-    }
-    let preselected = if let Some(id) = &args.id {
-        Some(
-            candidates
-                .iter()
-                .position(|d| &d.id == id)
-                .with_context(|| format!("no plugin with id {id}"))?,
-        )
-    } else if let Some(i) = args.index {
-        if i >= candidates.len() {
-            bail!(
-                "--index {i} is out of range (the file has {} plugins)",
-                candidates.len()
-            );
-        }
-        Some(i)
-    } else if candidates.len() == 1 || args.dump {
-        Some(0)
-    } else {
-        None
-    };
-
-    if args.dump {
-        let d = &candidates[preselected.unwrap_or(0)];
-        let plugin = PluginInstance::new(PluginLibrary::load(&d.path)?, &d.id)?;
-        ui::dump(&plugin);
-        return Ok(());
-    }
-
-    if !std::io::stdout().is_terminal() {
-        bail!("lextrack needs a terminal (use --dump for plain output)");
-    }
-
-    let tty = TtyGuard::enter()?;
-    let mut term = Terminal::new(CrosstermBackend::new(tty.writer()?))?;
-    let result = (|| -> Result<()> {
-        let choice = match preselected {
-            Some(i) => i,
-            None => match ui::pick_plugin(&mut term, &candidates)? {
-                Some(i) => i,
-                None => return Ok(()),
-            },
-        };
-        let d = &candidates[choice];
-        let plugin = PluginInstance::new(PluginLibrary::load(&d.path)?, &d.id)?;
-        let mut audio = settings::AudioSettings::load();
-        if let Some(d) = args.device.clone() {
-            audio.device = d;
-        }
-        if let Some(r) = args.sample_rate {
-            audio.sample_rate = r;
-        }
-        if let Some(b) = args.buffer {
-            audio.buffer_size = b;
-        }
-        let mut app = ui::App::new(plugin, !args.no_audio, audio)?;
-        let r = app.run(&mut term);
-        app.shutdown();
-        r
-    })();
-    drop(term);
-    drop(tty);
+    let result = m8::app::run(args);
     if let Some(log) = log_path() {
         if std::fs::metadata(&log).is_ok_and(|m| m.len() > 0) {
             eprintln!(
-                "(console output from the plugin and audio system was saved to {})",
+                "(console output from the plugins and audio system was saved to {})",
                 log.display()
             );
         }
@@ -318,13 +63,13 @@ fn log_path() -> Option<PathBuf> {
 /// Puts the terminal in raw/alternate-screen mode and restores it on drop or
 /// panic. On Unix it also points stdout/stderr at a log file so that plugins
 /// printing to the console don't scribble over the UI.
-struct TtyGuard {
+pub struct TtyGuard {
     #[cfg(unix)]
     saved: Option<(i32, i32)>,
 }
 
 impl TtyGuard {
-    fn enter() -> Result<Self> {
+    pub fn enter() -> Result<Self> {
         terminal::enable_raw_mode()?;
         execute!(
             std::io::stdout(),
@@ -347,7 +92,7 @@ impl TtyGuard {
     }
 
     /// Where the UI should draw: the real terminal.
-    fn writer(&self) -> Result<Box<dyn Write + Send>> {
+    pub fn writer(&self) -> Result<Box<dyn Write + Send>> {
         #[cfg(unix)]
         if let Some((out, _)) = self.saved {
             use std::os::fd::FromRawFd;
@@ -372,10 +117,10 @@ impl Drop for TtyGuard {
     }
 }
 
-/// Ask the terminal to report key releases, so notes stop when their key is
-/// let go. Terminals that speak the kitty keyboard protocol (kitty, foot,
-/// WezTerm, Ghostty, Alacritty...) support this; others don't,
-/// and notes then stop on a timer instead. The Windows console always reports
+/// Ask the terminal to report key releases, so letter keys can be held like
+/// the M8's buttons. Terminals that speak the kitty keyboard protocol (kitty,
+/// foot, WezTerm, Ghostty, Alacritty...) support this; elsewhere modifier
+/// keys stand in for held buttons. The Windows console always reports
 /// releases.
 fn enable_key_releases() {
     use ratatui::crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
@@ -393,11 +138,11 @@ fn enable_key_releases() {
     } else {
         false
     };
-    notes::RELEASE_EVENTS.store(supported, std::sync::atomic::Ordering::Relaxed);
+    RELEASE_EVENTS.store(supported, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn restore_terminal_raw() {
-    if !cfg!(windows) && notes::RELEASE_EVENTS.load(std::sync::atomic::Ordering::Relaxed) {
+    if !cfg!(windows) && RELEASE_EVENTS.load(std::sync::atomic::Ordering::Relaxed) {
         let _ = execute!(
             std::io::stdout(),
             ratatui::crossterm::event::PopKeyboardEnhancementFlags

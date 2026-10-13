@@ -1,21 +1,20 @@
 # lextrack
 
-A terminal host for [CLAP](https://cleveraudio.org) audio plugins. It loads a plugin, plays its output through your sound card, and lists every plugin parameter in the terminal. You change parameters from the keyboard.
+A terminal tracker modelled on the [Dirtywave M8](https://dirtywave.com), with [CLAP](https://cleveraudio.org) plugins in place of the M8's built-in synths. It opens M8 song files (`.m8s`), shows them on an M8-style screen, and lets you play and edit them with the M8's eight buttons.
 
 ```
-┌ Test Tone lextrack 0.1.0 ─────────────────────────────────────────────────────┐
-│ Default Audio Device · 48000 Hz   out ██████████████░░░░░░  -16.2 dB          │
-└───────────────────────────────────────────────────────────────────────────────┘
-┌ 7 parameters ─────────────────────────────────────────────────────────────────┐
-│  Output / Level         -16.2 dB         ███████████████████████████▋········ │
-│  Output / Pan           Center           ██████████████████··················· │
-│  Output / Mute          Off              ●──────────────────────────────────── │
-│  Oscillator / Frequency 259.6 Hz         ████▍································ │
-│▶ Oscillator / Waveform  Saw              ─────────────────●─────────────────── │
-│  Oscillator / Detune    +0 st            ─────────────────●─────────────────── │
-│  Meter / Peak [ro]      -16.2 dB         █████▉······························· │
-└───────────────────────────────────────────────────────────────────────────────┘
- ↑↓ select  ←→ change  Shift fine  Ctrl coarse  Home/End min/max  d default ...
+SONG                             ███████
+                                   118.0
+   1  2  3  4  5  6  7  8
+00 00 02 04 -- -- -- -- --       1 C-3
+01 01 03 05 -- -- -- -- --       2 G-4
+02 -- -- -- -- -- -- -- --       3 ---
+03 -- -- -- -- -- -- -- --       4 ---
+...
+                                  P GM
+                                 LSCPIT
+                                  V
+                                  E
 ```
 
 ## Build
@@ -35,98 +34,85 @@ The binary is at `target/release/lextrack`. On PipeWire or PulseAudio systems, a
 ## Run
 
 ```bash
-lextrack                              # scan the standard CLAP folders, pick a plugin
-lextrack ~/.clap/Surge\ XT.clap       # load one file directly
-lextrack Plugin.clap --index 1        # a file with several plugins: pick by position...
-lextrack Plugin.clap --id com.x.y     # ...or by id
-lextrack --list                       # list installed plugins
-lextrack Plugin.clap --dump           # print parameters without the UI
-lextrack Plugin.clap --no-audio       # don't open the sound card
-lextrack --list-devices               # list audio outputs and the saved settings
+lextrack                                  # a new, empty song
+lextrack MYSONG.m8s                       # open a song (a new one if the file doesn't exist)
+lextrack MYSONG.m8s --plugin ~/.clap/Surge\ XT.clap   # one plugin for every instrument
+lextrack MYSONG.m8s --map mysong.map      # a plugin per instrument (see below)
+lextrack MYSONG.m8s --inst 03=~/.clap/Dexed.clap      # override one instrument
+lextrack MYSONG.m8s --info                # print the song and the plugin for each instrument
+lextrack MYSONG.m8s --render out.wav --seconds 60     # render to a WAV file
+lextrack examples/demo.m8s --plugin ~/.clap/Surge\ XT.clap   # a short demo song
+lextrack --list                           # list installed plugins
+lextrack --list-devices                   # list audio outputs and the saved settings
+lextrack MYSONG.m8s --no-audio            # don't open the sound card
 ```
 
-Folders scanned: `~/.clap`, `/usr/lib/clap` and `/usr/local/lib/clap` on Linux; `~/Library/Audio/Plug-Ins/CLAP` and `/Library/Audio/Plug-Ins/CLAP` on macOS; `%COMMONPROGRAMFILES%\CLAP` and `%LOCALAPPDATA%\Programs\Common\CLAP` on Windows. Folders in `$CLAP_PATH` are scanned too.
+`lextrack m8 ...` still works as an alias.
 
-## Audio output
+Plugins are found in `~/.clap`, `/usr/lib/clap` and `/usr/local/lib/clap` on Linux; `~/Library/Audio/Plug-Ins/CLAP` and `/Library/Audio/Plug-Ins/CLAP` on macOS; `%COMMONPROGRAMFILES%\CLAP` and `%LOCALAPPDATA%\Programs\Common\CLAP` on Windows; and in the folders in `$CLAP_PATH`.
 
-Press **F2** (or Ctrl+O) in the app to choose the output device, sample rate and buffer size. Use ↑↓ to pick a setting, ←→ to change it, and Enter to apply. lextrack restarts audio with the new settings and saves them, so the next run uses them too. Esc closes the screen without changes. "Default" means the system default for that setting.
+**Saving.** PROJECT > SAVE writes the song back to its `.m8s` file in the M8's own format, so it still opens on an M8. The plugin chosen for each instrument and every plugin's settings go next to it in `MYSONG.lextrack`, which is loaded with the song next time.
 
-Settings are saved in `~/.config/lextrack/settings.conf` on Linux, `~/Library/Application Support/lextrack/settings.conf` on macOS and `%APPDATA%\lextrack\settings.conf` on Windows. Set `$LEXTRACK_CONFIG` to use a different file.
+## Buttons
 
-The same settings can be given on the command line. These override the saved ones for that run only:
+The M8 has eight buttons: UP, DOWN, LEFT, RIGHT, SHIFT, PLAY, OPTION and EDIT. Almost everything is one button pressed while others are held. A terminal can't report a modifier key on its own, so each button has two spellings:
 
-```bash
-lextrack Plugin.clap --device speakers --sample-rate 48000 --buffer 256
-lextrack Plugin.clap --buffer default     # use the device's default buffer this time
-```
+| M8 button | Key | Held with an arrow |
+| --- | --- | --- |
+| UP DOWN LEFT RIGHT | Arrow keys | |
+| SHIFT | A | Shift + arrow |
+| OPTION | Z or Esc | Alt + arrow |
+| EDIT | X or Enter | Ctrl + arrow |
+| PLAY | S or Space | |
+| EDIT+OPTION | Delete or Backspace | |
+| Quit | Ctrl+Q | |
 
-Device names are the ones `lextrack --list-devices` prints. On Linux they are ALSA names: `default` and `pipewire` / `pulse` go through the sound server, and `hw:` / `plughw:` names open a card directly. If the chosen device can't be opened (unplugged, or it rejects the rate or buffer size), lextrack falls back to the system default and says so.
+In terminals that report key releases (kitty, foot, WezTerm, Ghostty, Alacritty, and the Windows console), A, Z, X and S can be held like the M8's buttons: hold X and press Right for EDIT+RIGHT, or hold Z and press X for OPTION+EDIT. Elsewhere the modifier keys do the holding, with letters as well as arrows: Shift+Z is SHIFT+OPTION, Shift+X is SHIFT+EDIT, Shift+S is SHIFT+PLAY, Ctrl+S is EDIT+PLAY, Alt+S is OPTION+PLAY, Alt+A is OPTION+SHIFT and Alt+Shift+S is OPTION+SHIFT+PLAY.
 
-## Keys
-
-| Key | Action |
+| Combination | Action |
 | --- | --- |
-| ↑ / ↓ | Select the previous or next parameter |
-| ← / → | Decrease or increase the selected parameter. Continuous parameters move 1% of their range; stepped and choice parameters move one step |
-| Shift + ← / → | Fine: 0.1% of the range |
-| Ctrl + ← / → | Coarse: 10% of the range |
-| Home / End | Minimum / maximum |
-| Delete / Backspace | Reset to the default value |
-| Enter | Type a value, for example `440` or `-6 dB`. The plugin parses the text |
-| / | Filter parameters by name; Esc clears the filter |
-| PgUp / PgDn | Move 10 rows |
-| Tab | Show or hide the plugin's log messages |
-| F2 or Ctrl+O | Audio output settings |
-| q / Esc | Quit |
+| SHIFT + arrows | Move between views (see the map below) |
+| EDIT | On an empty cell, insert the last value used in that column. Press twice quickly on a chain, phrase or instrument number for a new, unused one |
+| EDIT + LEFT / RIGHT | Change the value by 1 |
+| EDIT + UP / DOWN | Change the value by 16 (an octave for notes) |
+| EDIT + OPTION | Delete. On an empty note, insert a note off |
+| OPTION + UP / DOWN | Song: jump 16 rows. Chain: the chain on the previous or next song row. Phrase: the previous or next phrase in the chain |
+| OPTION + LEFT / RIGHT | Chain and phrase: the same row on the previous or next track. Instrument, table, groove: the previous or next number (UP / DOWN jump by 16) |
+| SHIFT + OPTION | Start a selection. Move to extend it, press SHIFT+OPTION again to widen it to whole columns, rows, then everything. OPTION copies, EDIT+OPTION cuts, SHIFT+EDIT clones the chain, phrase or instrument under the cursor |
+| SHIFT + EDIT | Paste |
+| PLAY | Song: play from the cursor row. Chain: loop the chain. Phrase: loop the phrase. Press again to stop |
+| SHIFT + PLAY | From a chain or phrase, play the song from that row |
+| EDIT + PLAY | Preview the instrument |
+| OPTION + PLAY | Solo the track |
+| OPTION + SHIFT | Mute the track |
+| OPTION + SHIFT + PLAY | Clear all mutes and solos |
 
-Read-only parameters (meters) are shown greyed out and update live. Hidden parameters are not shown.
+## Views
 
-### Playing notes
-
-The keyboard works like a piano laid over the home row:
+The mini-map at the bottom right shows where you are. SHIFT+arrows move along it, as on the M8:
 
 ```
- w e   t y u   o p          black keys   C#  D#    F#  G#  A#    C#  D#
-a s d f g h j k l ; '       white keys  C  D  E  F  G  A  B  C  D  E  F
+ P GM        P  project       G  groove        M  instrument mods
+LSCPIT       L  live          S  song          C  chain    P  phrase
+ V           I  instrument    T  table
+ E           V  mixer         E  effects
 ```
 
-| Key | Action |
-| --- | --- |
-| a s d f g h j k l ; ' | White keys, starting from C |
-| w e t y u o p | Black keys |
-| z / x | One octave down / up. The header shows the current range; it starts at C4–F5 (`a` is middle C) |
-| Space | Stop all notes |
+- **SONG**: eight tracks of chain numbers, 256 rows. SHIFT+RIGHT opens the chain under the cursor.
+- **CHAIN**: up to 16 phrases (PH) with a transpose each (TSP). SHIFT+RIGHT opens the phrase.
+- **PHRASE**: 16 steps of note (N), volume (V), instrument (I) and three effects. SHIFT+RIGHT opens the step's instrument; SHIFT+UP opens the groove.
+- **INSTRUMENT**: the M8 type, name, transpose setting and table tick, and the CLAP plugin that plays it. EDIT on PLUGIN opens a list of installed plugins; EDIT+OPTION there removes the instrument's own choice. Below are the plugin's parameters, changed with EDIT+arrows and reset with EDIT+OPTION. SHIFT+RIGHT opens the instrument's table.
+- **TABLE**: 16 steps of transpose, volume and three effects (edited and saved, but not played yet).
+- **GROOVE**: the ticks per step, with the total per phrase (96 is straight time).
+- **PROJECT**: tempo, transpose, name, SAVE / LOAD / NEW (press EDIT twice to drop unsaved changes), RENDER to a WAV file, and the audio output: device, sample rate and buffer size. APPLY restarts audio with them and saves them for next time.
 
-The header shows the notes that are sounding. Notes go to the plugin's first note input as CLAP note events, or as MIDI when the plugin only accepts MIDI. For plugins with no note input, the header says so.
+The right-hand panel shows the output level, the tempo, and the note on each track, with M or S on muted and soloed tracks. Live, mixer, effects and instrument mods are dimmed on the map: they aren't there yet.
 
-**Releasing notes.** Most terminals don't report when a key is let go. lextrack handles this in two ways:
+Audio settings are saved in `~/.config/lextrack/settings.conf` on Linux, `~/Library/Application Support/lextrack/settings.conf` on macOS and `%APPDATA%\lextrack\settings.conf` on Windows (`$LEXTRACK_CONFIG` overrides this). `--device`, `--sample-rate` and `--buffer` override them for one run. If the chosen device can't be opened, lextrack falls back to the system default and the project view says so.
 
-- In terminals that support the kitty keyboard protocol (kitty, foot, WezTerm, Ghostty, Alacritty), and in the Windows console, a note sounds for exactly as long as you hold the key.
-- Everywhere else (GNOME Terminal, xterm, tmux and others), the header says *timed notes*. A tap plays for 0.7 s. Holding the key down keeps the note going through the keyboard's auto-repeat, and the note stops about 0.15 s after you let go. A key can't re-strike its own note until that note has stopped.
+## Instrument maps
 
-## Playing M8 songs
-
-`lextrack m8` plays song files (`.m8s`) from a [Dirtywave M8](https://dirtywave.com) tracker. CLAP plugins take the place of the M8's built-in synths: each M8 instrument the song uses gets its own plugin instance, and the song's notes are sent to it.
-
-```bash
-lextrack m8 MYSONG.m8s --plugin ~/.clap/Surge\ XT.clap      # one plugin for every instrument
-lextrack m8 MYSONG.m8s --map mysong.map                     # a plugin per instrument (see below)
-lextrack m8 MYSONG.m8s --map mysong.map --inst 03=~/.clap/Dexed.clap   # override one instrument
-lextrack m8 MYSONG.m8s --map mysong.map --info              # print the song and the plugin chosen for each instrument
-lextrack m8 MYSONG.m8s --plugin synth.clap --render out.wav --seconds 60   # render to a WAV file
-lextrack m8 examples/demo.m8s --plugin ~/.clap/Surge\ XT.clap   # a short demo song
-```
-
-The screen shows the song rows for the eight tracks, and the chain and phrase of the selected track. Play positions are highlighted as the song plays.
-
-| Key | Action |
-| --- | --- |
-| ↑ / ↓, PgUp / PgDn | Move the song cursor |
-| ← / → | Select a track (its chain and phrase are shown) |
-| Space or Enter | Play from the cursor row, or stop |
-| q / Esc | Quit |
-
-**Instrument maps.** A map file says which plugin plays each instrument, one rule per line. Rules by instrument number win over rules by kind, and kinds win over `default`. `--plugin` sets `default`; `--inst KEY=PLUGIN` adds a rule. Relative paths are relative to the map file. See [`examples/demo.map`](examples/demo.map).
+ A map file says which plugin plays each instrument, one rule per line. Rules by instrument number win over rules by kind, and kinds win over `default`. Picking a plugin in the instrument view adds a rule by number. `--plugin` sets `default`; `--inst KEY=PLUGIN` adds a rule; `--map FILE` uses a map file instead of `SONG.lextrack`. Relative paths are relative to the map file. See [`examples/demo.map`](examples/demo.map).
 
 ```
 00 = ~/.clap/Surge XT.clap              # instrument 00, in hex as the M8 shows it
@@ -137,7 +123,7 @@ default = ~/.clap/Surge XT.clap         # everything else
 
 Kinds are `wavsynth`, `macrosynth`, `sampler`, `midiout` and `fmsynth`.
 
-**How the song is played.**
+## How songs are played
 
 - Tracks run independently, like on the M8. Each plays its chain on the current song row, then moves to the next row. An empty row sends the track back to the first row of its block, so blocks loop.
 - Timing is 24 ticks per beat. Each phrase step lasts as many ticks as the track's groove says (6 by default). Notes reach the plugin on the exact sample.
@@ -147,25 +133,24 @@ Kinds are `wavsynth`, `macrosynth`, `sampler`, `midiout` and `fmsynth`.
 - Chain transpose applies to instruments whose TRANSP setting is on.
 - Effects: `DEL` (delay the note), `GRV` (change groove), `HOP` (jump to a phrase step), `KIL` (cut the note) and `TPO` (tempo). Other effects are ignored for now.
 
-**Not supported yet for M8 songs:** instrument tables, the remaining effects, the M8 mixer and send effects, mapping M8 instrument parameters to plugin parameters, saving plugin settings with the song, live/chain/phrase play modes, and editing. Songs from M8 firmware 2.x are supported; m8-js documents the file format up to firmware 2.7, so songs saved by firmware 3 or later have not been tested.
+## Not supported yet
 
-The song reader is a Rust port of [m8-js](https://github.com/whitlockjc/m8-js) by Jeremy Whitlock (Apache License 2.0); see [NOTICE](NOTICE).
+- Instrument tables, the remaining effects, the M8 mixer and send effects, live mode and instrument modulators.
+- Mapping M8 instrument parameters (filters, envelopes...) to plugin parameters. Each instrument plays its plugin's own settings.
+- Plugin GUI windows: plugins are controlled from the instrument view only.
+- Songs from M8 firmware 2.x are supported; m8-js documents the file format up to firmware 2.7, so songs saved by firmware 3 or later have not been tested.
+
+The song reader and writer are a Rust port of [m8-js](https://github.com/whitlockjc/m8-js) by Jeremy Whitlock (Apache License 2.0); see [NOTICE](NOTICE).
 
 ## How it works
 
-- `src/plugin.rs` loads the `.clap` binary and creates the plugin instance. It also implements the host side of the CLAP API (`clap.params`, `clap.log`, `clap.thread-check`, `clap.state`, `clap.audio-ports`).
-- `src/engine.rs` activates the plugin and calls `process` from the sound card callback (via cpal). If no device is available, a silent timer thread calls it instead. Parameter changes go to the plugin as `CLAP_EVENT_PARAM_VALUE` events in the next audio block.
-- `src/settings.rs` loads and saves the audio settings.
-- `src/notes.rs` maps computer keys to notes and decides when they stop.
-- `src/ui.rs` holds the terminal UI (ratatui). Values shown on screen are re-read from the plugin about 30 times a second, so changes the plugin makes itself show up too.
-- `src/discovery.rs` finds plugins in the standard CLAP folders.
-- `src/m8/` plays M8 songs: `format.rs` reads `.m8s` files, `sequencer.rs` turns song rows, chains and phrases into note events tick by tick, `rack.rs` runs one plugin per instrument and mixes them, `instruments.rs` reads instrument maps and `app.rs` is the `lextrack m8` command and screen.
+- `src/m8/format.rs` reads and writes `.m8s` files. Saving changes only the bytes that were edited, so unknown parts of the file survive.
+- `src/m8/sequencer.rs` turns song rows, chains and phrases into note events tick by tick, and handles chain and phrase looping, mutes and solos.
+- `src/m8/rack.rs` runs one plugin per instrument, mixes them, and plays them through the sound card (via cpal) or renders them to a WAV file. Notes reach the plugins on the exact sample.
+- `src/m8/instruments.rs` reads and writes instrument maps and plugin states.
+- `src/m8/screen.rs` is the 40x24 character screen in the M8's default colours; `src/m8/input.rs` turns keys into M8 button presses; `src/m8/ui.rs` holds the views; `src/m8/app.rs` is the command line.
+- `src/plugin.rs` loads `.clap` files and implements the host side of the CLAP API (`clap.params`, `clap.state`, `clap.log`, `clap.thread-check`, `clap.audio-ports`).
+- `src/audio.rs`, `src/settings.rs` and `src/discovery.rs` find sound cards, save audio settings and find plugins.
 - `test-plugin/` is a tiny test-tone CLAP plugin used for testing. Build it with `cargo build -p lextrack-test-plugin`, then copy `target/debug/liblextrack_test_plugin.so` to `~/.clap/TestTone.clap`.
 
 On Linux and macOS, anything a plugin prints to the console goes to `lextrack-plugin-output.log` in the temp folder, so it doesn't break the display.
-
-## Not supported yet
-
-- No plugin GUI windows: control is terminal only.
-- No audio input or external MIDI input, so effects get silence. Instruments can be played from the computer keyboard.
-- Plugin state is not saved or loaded.

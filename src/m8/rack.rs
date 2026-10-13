@@ -18,10 +18,10 @@ use cpal::{FromSample, Sample, SizedSample};
 use super::format::{Song, INSTRUMENTS, TRACKS};
 use super::instruments::{InstrumentMap, PluginRef};
 use super::sequencer::{samples_per_tick, Pos, SeqEvent, Sequencer};
-use crate::engine::{find_device, pick_config, MAX_BLOCK};
+use crate::audio::{find_device, pick_config, MAX_BLOCK};
 use crate::plugin::{
-    discard_output_events, mark_audio_thread, EventList, HostEvent, PluginInstance, PluginLibrary,
-    RawPlugin,
+    discard_output_events, mark_audio_thread, EventList, HostEvent, ParamChange, PluginInstance,
+    PluginLibrary, RawPlugin,
 };
 use crate::settings::AudioSettings;
 
@@ -32,17 +32,42 @@ pub struct Slot {
     pub plugin: PluginInstance,
 }
 
+/// The instruments that need a plugin: those the song plays, plus those
+/// given a plugin of their own.
+pub fn wanted_instruments(song: &Song, map: &InstrumentMap) -> Vec<u8> {
+    let mut v = song.used_instruments();
+    v.extend(map.numbered());
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
 /// Instantiate a plugin for every instrument the song plays. Returns the
 /// slots and, for instruments without a plugin, why not.
 pub fn load_slots(song: &Song, map: &InstrumentMap) -> (Vec<Slot>, Vec<(u8, String)>) {
+    load_slots_reusing(song, map, Vec::new())
+}
+
+/// Like [`load_slots`], keeping plugins from `old` whose instrument still
+/// has the same plugin, so their settings carry over.
+pub fn load_slots_reusing(
+    song: &Song,
+    map: &InstrumentMap,
+    old: Vec<Slot>,
+) -> (Vec<Slot>, Vec<(u8, String)>) {
+    let mut old: HashMap<u8, Slot> = old.into_iter().map(|s| (s.instrument, s)).collect();
     let mut libs: HashMap<PathBuf, Arc<PluginLibrary>> = HashMap::new();
     let mut slots = Vec::new();
     let mut missing = Vec::new();
-    for n in song.used_instruments() {
+    for n in wanted_instruments(song, map) {
         let Some(source) = map.resolve(n, &song.instruments[n as usize]) else {
             missing.push((n, "no plugin mapped".to_string()));
             continue;
         };
+        if let Some(slot) = old.remove(&n).filter(|s| &s.source == source) {
+            slots.push(slot);
+            continue;
+        }
         match instantiate(source, &mut libs) {
             Ok(plugin) => slots.push(Slot {
                 instrument: n,
@@ -80,7 +105,15 @@ fn instantiate(
 
 enum Command {
     Play(usize),
+    PlayChain(usize, usize),
+    PlayPhrase(usize, Pos),
     Stop,
+    Song(Arc<Song>),
+    Mutes(u8, u8),
+    /// Sound a note on an instrument outside the sequencer: (instrument,
+    /// M8 note, on).
+    Preview(u8, i16, bool),
+    Param(u8, ParamChange),
 }
 
 /// State shared between the UI and the audio thread.
@@ -146,16 +179,46 @@ impl RackShared {
         })
     }
 
-    pub fn play_from(&self, row: usize) {
-        if let Ok(mut c) = self.commands.lock() {
-            c.push(Command::Play(row));
+    fn send(&self, c: Command) {
+        if let Ok(mut q) = self.commands.lock() {
+            q.push(c);
         }
     }
 
+    /// Play all tracks from song row `row`.
+    pub fn play_from(&self, row: usize) {
+        self.send(Command::Play(row));
+    }
+
+    /// Loop the chain on `row` of `track`.
+    pub fn play_chain(&self, track: usize, row: usize) {
+        self.send(Command::PlayChain(track, row));
+    }
+
+    /// Loop one phrase on `track`.
+    pub fn play_phrase(&self, track: usize, pos: Pos) {
+        self.send(Command::PlayPhrase(track, pos));
+    }
+
     pub fn stop_song(&self) {
-        if let Ok(mut c) = self.commands.lock() {
-            c.push(Command::Stop);
-        }
+        self.send(Command::Stop);
+    }
+
+    /// Hand the audio thread an edited song.
+    pub fn set_song(&self, song: Arc<Song>) {
+        self.send(Command::Song(song));
+    }
+
+    pub fn set_mutes(&self, muted: u8, soloed: u8) {
+        self.send(Command::Mutes(muted, soloed));
+    }
+
+    pub fn preview(&self, instrument: u8, note: i16, on: bool) {
+        self.send(Command::Preview(instrument, note, on));
+    }
+
+    pub fn set_param(&self, instrument: u8, change: ParamChange) {
+        self.send(Command::Param(instrument, change));
     }
 
     pub fn take_peak(&self) -> f32 {
@@ -377,7 +440,36 @@ impl Processor {
                         self.seq.play_from(row, &mut self.seq_events);
                         self.until_tick = 0.0;
                     }
+                    Command::PlayChain(track, row) => {
+                        self.seq.play_chain(track, row, &mut self.seq_events);
+                        self.until_tick = 0.0;
+                    }
+                    Command::PlayPhrase(track, pos) => {
+                        self.seq.play_phrase(track, pos, &mut self.seq_events);
+                        self.until_tick = 0.0;
+                    }
                     Command::Stop => self.seq.stop(&mut self.seq_events),
+                    Command::Song(song) => self.seq.set_song(song),
+                    Command::Mutes(m, s) => self.seq.set_mutes(m, s),
+                    Command::Preview(inst, note, on) => self.seq_events.push(if on {
+                        SeqEvent::NoteOn {
+                            track: 0,
+                            instrument: inst,
+                            note,
+                            velocity: 0.8,
+                        }
+                    } else {
+                        SeqEvent::NoteOff {
+                            track: 0,
+                            instrument: inst,
+                            note,
+                        }
+                    }),
+                    Command::Param(inst, change) => {
+                        if let Some(i) = self.slot_of[inst as usize] {
+                            self.slots[i].events.push_at(HostEvent::Param(change), 0);
+                        }
+                    }
                 }
             }
         }
