@@ -17,11 +17,12 @@ use ratatui::widgets::{
 };
 use ratatui::{Frame, Terminal};
 
-use crate::engine::Engine;
+use crate::engine::{self, Engine};
 use crate::notes::{self, Keyboard};
 use crate::plugin::{
     HostEvent, NoteInput, ParamChange, ParamInfo, PluginDescriptor, PluginInstance,
 };
+use crate::settings::{self, AudioSettings};
 
 const FRAME: Duration = Duration::from_millis(33);
 
@@ -105,6 +106,8 @@ enum Mode {
     Edit(String),
     /// Typing a filter string.
     Filter(String),
+    /// The audio settings screen.
+    Settings(SettingsScreen),
 }
 
 #[derive(Clone, Copy)]
@@ -118,6 +121,8 @@ pub struct App {
     plugin: PluginInstance,
     engine: Option<Engine>,
     use_device: bool,
+    /// The audio settings in use (saved ones, or command-line overrides).
+    audio: AudioSettings,
     rows: Vec<ParamRow>,
     /// Indexes into `rows` that pass the filter.
     visible: Vec<usize>,
@@ -133,12 +138,13 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(mut plugin: PluginInstance, use_device: bool) -> Result<Self> {
-        let engine = Engine::start(&mut plugin, use_device)?;
+    pub fn new(mut plugin: PluginInstance, use_device: bool, audio: AudioSettings) -> Result<Self> {
+        let engine = Engine::start(&mut plugin, use_device, &audio)?;
         let mut app = App {
             plugin,
             engine: Some(engine),
             use_device,
+            audio,
             rows: vec![],
             visible: vec![],
             table: TableState::default(),
@@ -153,6 +159,7 @@ impl App {
         };
         app.note_input = app.plugin.note_input();
         app.reload_params();
+        app.report_audio_problem();
         Ok(app)
     }
 
@@ -204,20 +211,58 @@ impl App {
             self.send_note(key, false);
         }
         if shared.restart_requested.swap(false, Ordering::AcqRel) {
-            self.all_notes_off();
-            if let Some(mut e) = self.engine.take() {
-                e.stop(&mut self.plugin);
-            }
-            match Engine::start(&mut self.plugin, self.use_device) {
-                Ok(e) => self.engine = Some(e),
-                Err(err) => self.flash(format!("restart failed: {err:#}")),
-            }
-            self.note_input = self.plugin.note_input();
-            self.reload_params();
+            self.restart_engine();
         }
         if let Some(e) = &self.engine {
             let p = e.shared.take_peak();
             self.meter = p.max(self.meter * 0.85);
+        }
+    }
+
+    /// Stop audio, then start it again with `self.audio`.
+    fn restart_engine(&mut self) {
+        self.all_notes_off();
+        if let Some(mut e) = self.engine.take() {
+            // Give the audio thread a block to deliver the note-offs.
+            std::thread::sleep(Duration::from_millis(30));
+            e.stop(&mut self.plugin);
+        }
+        match Engine::start(&mut self.plugin, self.use_device, &self.audio) {
+            Ok(e) => self.engine = Some(e),
+            Err(err) => self.flash(format!("audio restart failed: {err:#}")),
+        }
+        self.note_input = self.plugin.note_input();
+        self.reload_params();
+    }
+
+    /// Tell the user if the chosen output couldn't be used.
+    fn report_audio_problem(&mut self) -> bool {
+        let problem = self.engine.as_ref().and_then(|e| e.problem.clone());
+        match problem {
+            Some(p) => {
+                self.flash(format!(
+                    "{p}; using the default output instead (F2 to change)"
+                ));
+                true
+            }
+            None if self.use_device && self.engine.as_ref().is_some_and(|e| e.is_silent()) => {
+                self.flash(
+                    "no audio output available; running silently (Tab shows the log)".into(),
+                );
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn apply_settings(&mut self, new: AudioSettings) {
+        self.audio = new;
+        self.restart_engine();
+        if !self.report_audio_problem() {
+            match self.audio.save() {
+                Ok(p) => self.flash(format!("audio settings saved to {}", p.display())),
+                Err(e) => self.flash(format!("audio works, but saving failed: {e:#}")),
+            }
         }
     }
 
@@ -347,6 +392,27 @@ impl App {
                 self.filter = s;
                 self.apply_filter();
             }
+            Mode::Settings(mut screen) => match k.code {
+                KeyCode::Esc | KeyCode::F(2) => {}
+                KeyCode::Enter => self.apply_settings(screen.chosen()),
+                KeyCode::Up => {
+                    screen.row = screen.row.saturating_sub(1);
+                    self.mode = Mode::Settings(screen);
+                }
+                KeyCode::Down => {
+                    screen.row = (screen.row + 1).min(2);
+                    self.mode = Mode::Settings(screen);
+                }
+                KeyCode::Left => {
+                    screen.step(-1);
+                    self.mode = Mode::Settings(screen);
+                }
+                KeyCode::Right => {
+                    screen.step(1);
+                    self.mode = Mode::Settings(screen);
+                }
+                _ => self.mode = Mode::Settings(screen),
+            },
             Mode::Normal => self.on_normal_key(k),
         }
     }
@@ -440,6 +506,14 @@ impl App {
             }
             KeyCode::Char('/') => self.mode = Mode::Filter(self.filter.clone()),
             KeyCode::Tab => self.show_log = !self.show_log,
+            KeyCode::F(2) => {
+                self.all_notes_off();
+                self.mode = Mode::Settings(SettingsScreen::new(&self.audio));
+            }
+            KeyCode::Char('o') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.all_notes_off();
+                self.mode = Mode::Settings(SettingsScreen::new(&self.audio));
+            }
             _ => {}
         }
     }
@@ -560,6 +634,9 @@ impl App {
         }
         self.draw_footer(f, footer);
 
+        if let Mode::Settings(screen) = &self.mode {
+            screen.draw(f, self.engine.as_ref());
+        }
         if let Mode::Edit(s) = &self.mode {
             let name = self
                 .selected_row()
@@ -581,7 +658,13 @@ impl App {
         let d = &self.plugin.descriptor;
         let audio = match &self.engine {
             Some(e) if e.is_silent() => format!("no audio output · {} Hz", e.sample_rate),
-            Some(e) => format!("{} · {} Hz", e.output_name, e.sample_rate),
+            Some(e) => format!(
+                "{} · {} Hz · {}",
+                e.output_name,
+                e.sample_rate,
+                e.buffer_size
+                    .map_or("default buffer".into(), |b| format!("{b} frames"))
+            ),
             None => "stopped".into(),
         };
         let meter_w = 20usize;
@@ -734,7 +817,7 @@ impl App {
         }
         let text = match &self.mode {
             Mode::Filter(s) => format!(" filter: {s}█   (Enter keep, Esc clear)"),
-            _ => " ↑↓ select  ←→ change  Shift fine  Ctrl coarse  Home/End min/max  Del default  Enter type  / filter  Tab log  q quit".into(),
+            _ => " ↑↓ select  ←→ change  Shift fine  Ctrl coarse  Home/End min/max  Del default  Enter type  / filter  Tab log  F2 audio  q quit".into(),
         };
         f.render_widget(Paragraph::new(text).dark_gray(), area);
     }
@@ -827,6 +910,160 @@ pub fn dump(plugin: &PluginInstance) {
             format_number(p.max),
             format_number(p.default),
             flags.join(",")
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Audio settings screen
+// ---------------------------------------------------------------------------
+
+struct SettingsScreen {
+    /// 0 = device, 1 = sample rate, 2 = buffer size.
+    row: usize,
+    /// `None` is "system default" in each list.
+    devices: Vec<Option<String>>,
+    device: usize,
+    rates: Vec<Option<u32>>,
+    rate: usize,
+    buffers: Vec<Option<u32>>,
+    buffer: usize,
+    default_name: Option<String>,
+}
+
+impl SettingsScreen {
+    fn new(current: &AudioSettings) -> Self {
+        let mut devices: Vec<Option<String>> = vec![None];
+        devices.extend(engine::output_devices().into_iter().map(Some));
+        // Keep a saved device in the list even if it is unplugged right now.
+        if current.device.is_some() && !devices.contains(&current.device) {
+            devices.push(current.device.clone());
+        }
+        let device = devices
+            .iter()
+            .position(|d| *d == current.device)
+            .unwrap_or(0);
+        let mut buffers: Vec<Option<u32>> = vec![None];
+        buffers.extend(settings::BUFFER_SIZES.iter().map(|&b| Some(b)));
+        if current.buffer_size.is_some() && !buffers.contains(&current.buffer_size) {
+            buffers.push(current.buffer_size);
+        }
+        let buffer = buffers
+            .iter()
+            .position(|b| *b == current.buffer_size)
+            .unwrap_or(0);
+        let mut screen = SettingsScreen {
+            row: 0,
+            devices,
+            device,
+            rates: vec![],
+            rate: 0,
+            buffers,
+            buffer,
+            default_name: engine::default_device_name(),
+        };
+        screen.refresh_rates(current.sample_rate);
+        screen
+    }
+
+    /// Rebuild the sample-rate list for the selected device, keeping `keep`
+    /// selected if the device supports it.
+    fn refresh_rates(&mut self, keep: Option<u32>) {
+        let mut rates: Vec<Option<u32>> = vec![None];
+        let supported = engine::supported_rates(self.devices[self.device].as_deref());
+        if supported.is_empty() {
+            // Couldn't ask the device: offer the usual rates anyway.
+            rates.extend(settings::SAMPLE_RATES.iter().map(|&r| Some(r)));
+        } else {
+            rates.extend(supported.into_iter().map(Some));
+        }
+        if keep.is_some() && !rates.contains(&keep) {
+            rates.push(keep);
+        }
+        self.rate = rates.iter().position(|r| *r == keep).unwrap_or(0);
+        self.rates = rates;
+    }
+
+    fn step(&mut self, dir: i32) {
+        fn bump(i: usize, len: usize, dir: i32) -> usize {
+            (i as i32 + dir).clamp(0, len as i32 - 1) as usize
+        }
+        match self.row {
+            0 => {
+                let keep = self.rates[self.rate];
+                self.device = bump(self.device, self.devices.len(), dir);
+                self.refresh_rates(keep);
+            }
+            1 => self.rate = bump(self.rate, self.rates.len(), dir),
+            _ => self.buffer = bump(self.buffer, self.buffers.len(), dir),
+        }
+    }
+
+    fn chosen(&self) -> AudioSettings {
+        AudioSettings {
+            device: self.devices[self.device].clone(),
+            sample_rate: self.rates[self.rate],
+            buffer_size: self.buffers[self.buffer],
+        }
+    }
+
+    fn draw(&self, f: &mut Frame, engine: Option<&Engine>) {
+        let device = match &self.devices[self.device] {
+            Some(d) => d.clone(),
+            None => match &self.default_name {
+                Some(n) => format!("System default ({n})"),
+                None => "System default".into(),
+            },
+        };
+        let rate = self.rates[self.rate].map_or("Device default".into(), |r| format!("{r} Hz"));
+        let buffer = self.buffers[self.buffer].map_or("Device default".into(), |b| {
+            match self.rates[self.rate].or(engine.map(|e| e.sample_rate)) {
+                Some(sr) if sr > 0 => {
+                    format!("{b} frames ({:.1} ms)", b as f64 * 1000.0 / sr as f64)
+                }
+                _ => format!("{b} frames"),
+            }
+        });
+        let fields = [
+            ("Output device", device, self.device, self.devices.len()),
+            ("Sample rate", rate, self.rate, self.rates.len()),
+            ("Buffer size", buffer, self.buffer, self.buffers.len()),
+        ];
+        let mut lines = vec![Line::from("")];
+        for (i, (label, value, idx, len)) in fields.iter().enumerate() {
+            let left = if *idx > 0 { "◀ " } else { "  " };
+            let right = if idx + 1 < *len { " ▶" } else { "  " };
+            let style = if i == self.row {
+                Style::new()
+                    .bg(Color::Blue)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::new()
+            };
+            lines.push(Line::from(vec![
+                Span::raw(format!(" {label:<14}")),
+                Span::styled(format!("{left}{value}{right}"), style),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(
+            Line::from(" ↑↓ choose setting  ←→ change  Enter apply and save  Esc cancel")
+                .dark_gray(),
+        );
+        let area = f.area();
+        let w = 76.min(area.width.saturating_sub(2));
+        let h = (lines.len() as u16 + 2).min(area.height);
+        let rect = Rect::new(
+            (area.width - w) / 2,
+            area.height.saturating_sub(h) / 2,
+            w,
+            h,
+        );
+        f.render_widget(Clear, rect);
+        f.render_widget(
+            Paragraph::new(lines).block(Block::bordered().title(" Audio output ")),
+            rect,
         );
     }
 }

@@ -42,9 +42,25 @@ lextrack Plugin.clap --id com.x.y     # ...or by id
 lextrack --list                       # list installed plugins
 lextrack Plugin.clap --dump           # print parameters without the UI
 lextrack Plugin.clap --no-audio       # don't open the sound card
+lextrack --list-devices               # list audio outputs and the saved settings
 ```
 
 Folders scanned: `~/.clap`, `/usr/lib/clap` and `/usr/local/lib/clap` on Linux; `~/Library/Audio/Plug-Ins/CLAP` and `/Library/Audio/Plug-Ins/CLAP` on macOS; `%COMMONPROGRAMFILES%\CLAP` and `%LOCALAPPDATA%\Programs\Common\CLAP` on Windows. Folders in `$CLAP_PATH` are scanned too.
+
+## Audio output
+
+Press **F2** (or Ctrl+O) in the app to choose the output device, sample rate and buffer size. Use ↑↓ to pick a setting, ←→ to change it, and Enter to apply. lextrack restarts audio with the new settings and saves them, so the next run uses them too. Esc closes the screen without changes. "Default" means the system default for that setting.
+
+Settings are saved in `~/.config/lextrack/settings.conf` on Linux, `~/Library/Application Support/lextrack/settings.conf` on macOS and `%APPDATA%\lextrack\settings.conf` on Windows. Set `$LEXTRACK_CONFIG` to use a different file.
+
+The same settings can be given on the command line. These override the saved ones for that run only:
+
+```bash
+lextrack Plugin.clap --device speakers --sample-rate 48000 --buffer 256
+lextrack Plugin.clap --buffer default     # use the device's default buffer this time
+```
+
+Device names are the ones `lextrack --list-devices` prints. On Linux they are ALSA names: `default` and `pipewire` / `pulse` go through the sound server, and `hw:` / `plughw:` names open a card directly. If the chosen device can't be opened (unplugged, or it rejects the rate or buffer size), lextrack falls back to the system default and says so.
 
 ## Keys
 
@@ -60,6 +76,7 @@ Folders scanned: `~/.clap`, `/usr/lib/clap` and `/usr/local/lib/clap` on Linux; 
 | / | Filter parameters by name; Esc clears the filter |
 | PgUp / PgDn | Move 10 rows |
 | Tab | Show or hide the plugin's log messages |
+| F2 or Ctrl+O | Audio output settings |
 | q / Esc | Quit |
 
 Read-only parameters (meters) are shown greyed out and update live. Hidden parameters are not shown.
@@ -91,6 +108,7 @@ The header shows the notes that are sounding. Notes go to the plugin's first not
 
 - `src/plugin.rs` loads the `.clap` binary and creates the plugin instance. It also implements the host side of the CLAP API (`clap.params`, `clap.log`, `clap.thread-check`, `clap.state`, `clap.audio-ports`).
 - `src/engine.rs` activates the plugin and calls `process` from the sound card callback (via cpal). If no device is available, a silent timer thread calls it instead. Parameter changes go to the plugin as `CLAP_EVENT_PARAM_VALUE` events in the next audio block.
+- `src/settings.rs` loads and saves the audio settings.
 - `src/notes.rs` maps computer keys to notes and decides when they stop.
 - `src/ui.rs` holds the terminal UI (ratatui). Values shown on screen are re-read from the plugin about 30 times a second, so changes the plugin makes itself show up too.
 - `src/discovery.rs` finds plugins in the standard CLAP folders.

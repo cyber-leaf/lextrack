@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap_sys::audio_buffer::clap_audio_buffer;
 use clap_sys::process::clap_process;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -16,6 +16,7 @@ use crate::plugin::{
     discard_output_events, mark_audio_thread, EventList, HostEvent, HostShared, PluginInstance,
     RawPlugin,
 };
+use crate::settings::AudioSettings;
 
 /// Largest block handed to the plugin in a single `process` call.
 pub const MAX_BLOCK: usize = 1024;
@@ -51,7 +52,11 @@ enum Driver {
 pub struct Engine {
     pub shared: Arc<EngineShared>,
     pub sample_rate: u32,
+    /// Fixed buffer size in frames, or `None` for the device's default.
+    pub buffer_size: Option<u32>,
     pub output_name: String,
+    /// Why the requested settings couldn't be used, when we fell back.
+    pub problem: Option<String>,
     driver: Option<Driver>,
 }
 
@@ -206,7 +211,11 @@ impl Processor {
 impl Engine {
     /// Activate the plugin and start processing. Falls back to a silent
     /// timer-driven engine when `use_device` is false or no device works.
-    pub fn start(plugin: &mut PluginInstance, use_device: bool) -> Result<Engine> {
+    pub fn start(
+        plugin: &mut PluginInstance,
+        use_device: bool,
+        settings: &AudioSettings,
+    ) -> Result<Engine> {
         let shared = Arc::new(EngineShared {
             queue: Mutex::new(Vec::with_capacity(256)),
             stop: AtomicBool::new(false),
@@ -215,24 +224,49 @@ impl Engine {
             process_errors: AtomicU32::new(0),
         });
         if use_device {
-            match Self::start_device(plugin, shared.clone()) {
+            match Self::start_device(plugin, shared.clone(), settings) {
                 Ok(e) => return Ok(e),
-                Err(err) => plugin.shared.push_log(format!(
-                    "[host] audio device unavailable ({err:#}); running without sound"
-                )),
+                Err(err) => {
+                    plugin
+                        .shared
+                        .push_log(format!("[host] audio output failed: {err:#}"));
+                    if *settings != AudioSettings::default() {
+                        // Fall back to the system default before giving up on sound.
+                        match Self::start_device(plugin, shared.clone(), &AudioSettings::default())
+                        {
+                            Ok(mut e) => {
+                                e.problem = Some(format!("{err:#}"));
+                                return Ok(e);
+                            }
+                            Err(err) => plugin
+                                .shared
+                                .push_log(format!("[host] default audio output failed: {err:#}")),
+                        }
+                    }
+                }
             }
         }
         Self::start_null(plugin, shared)
     }
 
-    fn start_device(plugin: &mut PluginInstance, shared: Arc<EngineShared>) -> Result<Engine> {
-        let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or_else(|| anyhow!("no default output device"))?;
-        let supported = device.default_output_config()?;
+    fn start_device(
+        plugin: &mut PluginInstance,
+        shared: Arc<EngineShared>,
+        settings: &AudioSettings,
+    ) -> Result<Engine> {
+        let device = find_device(settings.device.as_deref())?;
+        let supported = pick_config(&device, settings.sample_rate)?;
         let format = supported.sample_format();
-        let config: cpal::StreamConfig = supported.into();
+        let buffer_range = *supported.buffer_size();
+        let mut config: cpal::StreamConfig = supported.into();
+        if let Some(frames) = settings.buffer_size {
+            if let cpal::SupportedBufferSize::Range { min, max } = buffer_range {
+                if frames < min || frames > max {
+                    bail!("buffer size {frames} is outside what the device allows ({min}..{max})");
+                }
+            }
+            config.buffer_size = cpal::BufferSize::Fixed(frames);
+        }
         let sample_rate = config.sample_rate.0;
         let channels = config.channels as usize;
         let output_name = device.name().unwrap_or_else(|_| "default output".into());
@@ -259,7 +293,9 @@ impl Engine {
         Ok(Engine {
             shared,
             sample_rate,
+            buffer_size: settings.buffer_size,
             output_name,
+            problem: None,
             driver: Some(Driver::Device(stream)),
         })
     }
@@ -293,7 +329,9 @@ impl Engine {
         Ok(Engine {
             shared,
             sample_rate,
+            buffer_size: Some(block as u32),
             output_name: "none (silent)".into(),
+            problem: None,
             driver: Some(Driver::Null(handle)),
         })
     }
@@ -337,4 +375,80 @@ where
         None,
     )?;
     Ok(stream)
+}
+
+/// Output devices of the default audio host, by name.
+pub fn output_devices() -> Vec<String> {
+    let host = cpal::default_host();
+    let mut names: Vec<String> = match host.output_devices() {
+        Ok(devs) => devs.filter_map(|d| d.name().ok()).collect(),
+        Err(_) => vec![],
+    };
+    names.dedup();
+    names
+}
+
+/// The name of the system default output device, if any.
+pub fn default_device_name() -> Option<String> {
+    cpal::default_host()
+        .default_output_device()
+        .and_then(|d| d.name().ok())
+}
+
+/// Sample rates (from `settings::SAMPLE_RATES`) that a device accepts.
+pub fn supported_rates(device: Option<&str>) -> Vec<u32> {
+    let Ok(dev) = find_device(device) else {
+        return vec![];
+    };
+    let Ok(ranges) = dev.supported_output_configs() else {
+        return vec![];
+    };
+    let ranges: Vec<_> = ranges.collect();
+    crate::settings::SAMPLE_RATES
+        .iter()
+        .copied()
+        .filter(|&r| {
+            ranges
+                .iter()
+                .any(|c| c.min_sample_rate().0 <= r && r <= c.max_sample_rate().0)
+        })
+        .collect()
+}
+
+fn find_device(name: Option<&str>) -> Result<cpal::Device> {
+    let host = cpal::default_host();
+    match name {
+        None => host
+            .default_output_device()
+            .ok_or_else(|| anyhow!("no default output device")),
+        Some(name) => host
+            .output_devices()
+            .context("can't list output devices")?
+            .find(|d| d.name().is_ok_and(|n| n == name))
+            .ok_or_else(|| anyhow!("output device \"{name}\" not found")),
+    }
+}
+
+/// The device's default configuration, or the best one at `rate`: stereo
+/// first, then 32-bit float.
+fn pick_config(device: &cpal::Device, rate: Option<u32>) -> Result<cpal::SupportedStreamConfig> {
+    let Some(rate) = rate else {
+        return Ok(device.default_output_config()?);
+    };
+    let mut candidates: Vec<_> = device
+        .supported_output_configs()?
+        .filter(|c| c.min_sample_rate().0 <= rate && rate <= c.max_sample_rate().0)
+        .collect();
+    candidates.sort_by_key(|c| {
+        (
+            c.channels() != 2,
+            c.sample_format() != cpal::SampleFormat::F32,
+            c.channels(),
+        )
+    });
+    candidates
+        .into_iter()
+        .next()
+        .map(|c| c.with_sample_rate(cpal::SampleRate(rate)))
+        .ok_or_else(|| anyhow!("the device doesn't support {rate} Hz"))
 }

@@ -19,6 +19,7 @@ mod discovery;
 mod engine;
 mod notes;
 mod plugin;
+mod settings;
 mod ui;
 
 use std::io::{IsTerminal, Write};
@@ -45,6 +46,12 @@ OPTIONS:
     --id <ID>       Plugin id to load when a file contains several plugins
     --index <N>     Same, by position (0-based)
     --no-audio      Don't open a sound card; process silently instead
+    --device <NAME>       Audio output device (see --list-devices), or \"default\"
+    --sample-rate <HZ>    Sample rate, e.g. 48000, or \"default\"
+    --buffer <FRAMES>     Buffer size, e.g. 256, or \"default\"
+                    These override the saved settings for this run. Press F2
+                    in the app to change and save them.
+    --list-devices  List audio output devices and exit
     --list          List installed plugins and exit
     --dump          Print the plugin's parameters and exit (no UI)
     -h, --help      Show this help
@@ -55,6 +62,7 @@ KEYS:
     Home/End        Minimum/maximum          Del/Backspace  Default value
     Enter           Type a value             /            Filter by name
     PgUp/PgDn       Jump 10 rows             Tab          Show plugin log
+    F2 or Ctrl+O    Audio output settings
     a s d f g h j k l ; '   Play white keys  w e t y u o p  Play black keys
     z / x           Octave down / up         Space        Stop all notes
     q / Esc         Quit
@@ -65,6 +73,10 @@ struct Args {
     id: Option<String>,
     index: Option<usize>,
     no_audio: bool,
+    device: Option<Option<String>>,
+    sample_rate: Option<Option<u32>>,
+    buffer: Option<Option<u32>>,
+    list_devices: bool,
     list: bool,
     dump: bool,
 }
@@ -75,6 +87,10 @@ fn parse_args() -> Result<Args> {
         id: None,
         index: None,
         no_audio: false,
+        device: None,
+        sample_rate: None,
+        buffer: None,
+        list_devices: false,
         list: false,
         dump: false,
     };
@@ -102,6 +118,16 @@ fn parse_args() -> Result<Args> {
                 )
             }
             Some("--no-audio") => a.no_audio = true,
+            Some("--list-devices") => a.list_devices = true,
+            Some("--device") => {
+                let v = it.next().context("--device needs a name")?;
+                let v = v.to_string_lossy();
+                a.device = Some((v != "default").then(|| v.into_owned()));
+            }
+            Some("--sample-rate") => {
+                a.sample_rate = Some(number_or_default(it.next(), "--sample-rate")?)
+            }
+            Some("--buffer") => a.buffer = Some(number_or_default(it.next(), "--buffer")?),
             Some("--list") => a.list = true,
             Some("--dump") => a.dump = true,
             Some(s) if s.starts_with('-') => bail!("unknown option {s}\n\n{USAGE}"),
@@ -109,6 +135,18 @@ fn parse_args() -> Result<Args> {
         }
     }
     Ok(a)
+}
+
+fn number_or_default(v: Option<std::ffi::OsString>, flag: &str) -> Result<Option<u32>> {
+    let v = v.with_context(|| format!("{flag} needs a value"))?;
+    let v = v.to_string_lossy();
+    if v == "default" {
+        return Ok(None);
+    }
+    let n: u32 = v
+        .parse()
+        .with_context(|| format!("{flag} expects a number or \"default\", not \"{v}\""))?;
+    Ok(Some(n))
 }
 
 fn main() {
@@ -120,6 +158,36 @@ fn main() {
 
 fn run() -> Result<()> {
     let args = parse_args()?;
+
+    if args.list_devices {
+        let default = engine::default_device_name();
+        let devices = engine::output_devices();
+        if devices.is_empty() {
+            println!("no audio output devices found");
+        }
+        for d in devices {
+            let mark = if Some(&d) == default.as_ref() {
+                "  (default)"
+            } else {
+                ""
+            };
+            println!("{d}{mark}");
+        }
+        if let Some(p) = settings::path() {
+            let s = settings::AudioSettings::load();
+            println!("\nsaved settings ({}):", p.display());
+            println!("  device      {}", s.device.as_deref().unwrap_or("default"));
+            println!(
+                "  sample rate {}",
+                s.sample_rate.map_or("default".into(), |r| r.to_string())
+            );
+            println!(
+                "  buffer      {}",
+                s.buffer_size.map_or("default".into(), |b| b.to_string())
+            );
+        }
+        return Ok(());
+    }
 
     if args.list {
         let scan = discovery::scan_default();
@@ -209,7 +277,17 @@ fn run() -> Result<()> {
         };
         let d = &candidates[choice];
         let plugin = PluginInstance::new(PluginLibrary::load(&d.path)?, &d.id)?;
-        let mut app = ui::App::new(plugin, !args.no_audio)?;
+        let mut audio = settings::AudioSettings::load();
+        if let Some(d) = args.device.clone() {
+            audio.device = d;
+        }
+        if let Some(r) = args.sample_rate {
+            audio.sample_rate = r;
+        }
+        if let Some(b) = args.buffer {
+            audio.buffer_size = b;
+        }
+        let mut app = ui::App::new(plugin, !args.no_audio, audio)?;
         let r = app.run(&mut term);
         app.shutdown();
         r
