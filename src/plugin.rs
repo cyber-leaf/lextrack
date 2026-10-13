@@ -18,6 +18,7 @@ use clap_sys::entry::clap_plugin_entry;
 use clap_sys::events::*;
 use clap_sys::ext::audio_ports::*;
 use clap_sys::ext::log::*;
+use clap_sys::ext::note_ports::*;
 use clap_sys::ext::params::*;
 use clap_sys::ext::state::*;
 use clap_sys::ext::thread_check::*;
@@ -393,6 +394,30 @@ pub struct ParamChange {
 }
 unsafe impl Send for ParamChange {}
 
+/// Anything the UI sends to the plugin through the audio thread.
+#[derive(Clone, Copy, Debug)]
+pub enum HostEvent {
+    Param(ParamChange),
+    /// A note starting (`on`) or stopping, as a MIDI key number 0..=127.
+    Note {
+        key: i16,
+        on: bool,
+        velocity: f64,
+    },
+}
+unsafe impl Send for HostEvent {}
+
+/// How the plugin wants to receive notes on its first note input port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoteInput {
+    /// The plugin has no note input.
+    None,
+    /// CLAP note events (preferred).
+    Clap { port: i16 },
+    /// Raw MIDI 1.0 bytes.
+    Midi { port: u16 },
+}
+
 /// A raw plugin pointer that may cross to the audio thread.
 #[derive(Clone, Copy)]
 pub struct RawPlugin(pub *const clap_plugin);
@@ -505,6 +530,33 @@ impl PluginInstance {
         }
     }
 
+    /// The plugin's first note input port, and the dialect to use with it.
+    pub fn note_input(&self) -> NoteInput {
+        let ext = self.extension(CLAP_EXT_NOTE_PORTS) as *const clap_plugin_note_ports;
+        let Some(ext) = (unsafe { ext.as_ref() }) else {
+            return NoteInput::None;
+        };
+        if ext.count.map_or(0, |c| unsafe { c(self.plugin, true) }) == 0 {
+            return NoteInput::None;
+        }
+        let mut info: clap_note_port_info = unsafe { std::mem::zeroed() };
+        if !ext
+            .get
+            .is_some_and(|g| unsafe { g(self.plugin, 0, true, &mut info) })
+        {
+            return NoteInput::None;
+        }
+        if info.supported_dialects & CLAP_NOTE_DIALECT_CLAP != 0 {
+            NoteInput::Clap { port: 0 }
+        } else if info.supported_dialects & (CLAP_NOTE_DIALECT_MIDI | CLAP_NOTE_DIALECT_MIDI_MPE)
+            != 0
+        {
+            NoteInput::Midi { port: 0 }
+        } else {
+            NoteInput::None
+        }
+    }
+
     /// Channel counts of every input and output audio port.
     pub fn audio_ports(&self) -> (Vec<u32>, Vec<u32>) {
         let ext = self.extension(CLAP_EXT_AUDIO_PORTS) as *const clap_plugin_audio_ports;
@@ -587,9 +639,9 @@ impl PluginInstance {
         let Some(flush) = (unsafe { (*self.params).flush }) else {
             return;
         };
-        let mut events = EventList::new();
+        let mut events = EventList::new(NoteInput::None);
         for c in changes {
-            events.push(*c);
+            events.push(HostEvent::Param(*c));
         }
         let out = discard_output_events();
         unsafe { flush(self.plugin, &events.as_input(), &out) };
@@ -609,16 +661,47 @@ impl Drop for PluginInstance {
 // Event lists
 // ---------------------------------------------------------------------------
 
-/// A reusable list of parameter events handed to the plugin as
-/// `clap_input_events`. It never allocates once capacity is reached.
+/// One event in an [`EventList`]. Each variant is a complete CLAP event
+/// struct starting with its header, so a pointer to the header is a pointer
+/// to the whole event.
+enum RawEvent {
+    Param(clap_event_param_value),
+    Note(clap_event_note),
+    Midi(clap_event_midi),
+}
+
+impl RawEvent {
+    fn header(&self) -> &clap_event_header {
+        match self {
+            RawEvent::Param(e) => &e.header,
+            RawEvent::Note(e) => &e.header,
+            RawEvent::Midi(e) => &e.header,
+        }
+    }
+}
+
+fn header<T>(type_: u16) -> clap_event_header {
+    clap_event_header {
+        size: std::mem::size_of::<T>() as u32,
+        time: 0,
+        space_id: CLAP_CORE_EVENT_SPACE_ID,
+        type_,
+        flags: CLAP_EVENT_IS_LIVE,
+    }
+}
+
+/// A reusable list of events handed to the plugin as `clap_input_events`.
+/// It never allocates once capacity is reached.
 pub struct EventList {
-    events: Vec<clap_event_param_value>,
+    events: Vec<RawEvent>,
+    notes: NoteInput,
 }
 
 impl EventList {
-    pub fn new() -> Self {
+    pub fn new(notes: NoteInput) -> Self {
         EventList {
             events: Vec::with_capacity(256),
+            notes,
         }
     }
 
@@ -626,23 +709,44 @@ impl EventList {
         self.events.clear();
     }
 
-    pub fn push(&mut self, c: ParamChange) {
-        self.events.push(clap_event_param_value {
-            header: clap_event_header {
-                size: std::mem::size_of::<clap_event_param_value>() as u32,
-                time: 0,
-                space_id: CLAP_CORE_EVENT_SPACE_ID,
-                type_: CLAP_EVENT_PARAM_VALUE,
-                flags: CLAP_EVENT_IS_LIVE,
+    pub fn push(&mut self, e: HostEvent) {
+        let raw = match e {
+            HostEvent::Param(c) => RawEvent::Param(clap_event_param_value {
+                header: header::<clap_event_param_value>(CLAP_EVENT_PARAM_VALUE),
+                param_id: c.id,
+                cookie: c.cookie,
+                note_id: -1,
+                port_index: -1,
+                channel: -1,
+                key: -1,
+                value: c.value,
+            }),
+            HostEvent::Note { key, on, velocity } => match self.notes {
+                NoteInput::None => return,
+                NoteInput::Clap { port } => RawEvent::Note(clap_event_note {
+                    header: header::<clap_event_note>(if on {
+                        CLAP_EVENT_NOTE_ON
+                    } else {
+                        CLAP_EVENT_NOTE_OFF
+                    }),
+                    note_id: -1,
+                    port_index: port,
+                    channel: 0,
+                    key,
+                    velocity,
+                }),
+                NoteInput::Midi { port } => RawEvent::Midi(clap_event_midi {
+                    header: header::<clap_event_midi>(CLAP_EVENT_MIDI),
+                    port_index: port,
+                    data: [
+                        if on { 0x90 } else { 0x80 },
+                        key.clamp(0, 127) as u8,
+                        (velocity * 127.0).round().clamp(1.0, 127.0) as u8,
+                    ],
+                }),
             },
-            param_id: c.id,
-            cookie: c.cookie,
-            note_id: -1,
-            port_index: -1,
-            channel: -1,
-            key: -1,
-            value: c.value,
-        });
+        };
+        self.events.push(raw);
     }
 
     /// The returned struct borrows `self`; keep `self` alive while it's used.
@@ -666,7 +770,7 @@ unsafe extern "C" fn event_list_get(
 ) -> *const clap_event_header {
     let l = &*((*list).ctx as *const EventList);
     match l.events.get(index as usize) {
-        Some(e) => &e.header,
+        Some(e) => e.header(),
         None => ptr::null(),
     }
 }

@@ -18,7 +18,10 @@ use ratatui::widgets::{
 use ratatui::{Frame, Terminal};
 
 use crate::engine::Engine;
-use crate::plugin::{ParamChange, ParamInfo, PluginDescriptor, PluginInstance};
+use crate::notes::{self, Keyboard};
+use crate::plugin::{
+    HostEvent, NoteInput, ParamChange, ParamInfo, PluginDescriptor, PluginInstance,
+};
 
 const FRAME: Duration = Duration::from_millis(33);
 
@@ -30,8 +33,7 @@ const FRAME: Duration = Duration::from_millis(33);
 pub fn pick_plugin<B: Backend>(
     term: &mut Terminal<B>,
     plugins: &[PluginDescriptor],
-) -> Result<Option<usize>>
-{
+) -> Result<Option<usize>> {
     let mut state = ListState::default().with_selected(Some(0));
     loop {
         term.draw(|f| {
@@ -125,6 +127,8 @@ pub struct App {
     show_log: bool,
     status: Option<(String, Instant)>,
     meter: f32,
+    keyboard: Keyboard,
+    note_input: NoteInput,
     quit: bool,
 }
 
@@ -143,14 +147,16 @@ impl App {
             show_log: false,
             status: None,
             meter: 0.0,
+            keyboard: Keyboard::new(),
+            note_input: NoteInput::None,
             quit: false,
         };
+        app.note_input = app.plugin.note_input();
         app.reload_params();
         Ok(app)
     }
 
-    pub fn run<B: Backend>(&mut self, term: &mut Terminal<B>) -> Result<()>
-    {
+    pub fn run<B: Backend>(&mut self, term: &mut Terminal<B>) -> Result<()> {
         while !self.quit {
             self.service_host();
             self.refresh_values(term.size()?.height as usize);
@@ -159,7 +165,9 @@ impl App {
                 // Drain everything queued so held keys don't lag behind.
                 loop {
                     if let Event::Key(k) = event::read()? {
-                        if k.kind != KeyEventKind::Release {
+                        if k.kind == KeyEventKind::Release {
+                            self.on_key_release(k);
+                        } else {
                             self.on_key(k);
                         }
                     }
@@ -173,7 +181,10 @@ impl App {
     }
 
     pub fn shutdown(mut self) {
+        self.all_notes_off();
         if let Some(mut e) = self.engine.take() {
+            // Give the audio thread a block to deliver the note-offs.
+            std::thread::sleep(Duration::from_millis(30));
             e.stop(&mut self.plugin);
         }
     }
@@ -189,7 +200,11 @@ impl App {
         if rescan & (CLAP_PARAM_RESCAN_INFO | CLAP_PARAM_RESCAN_ALL) != 0 {
             self.reload_params();
         }
+        for key in self.keyboard.expired(Instant::now()) {
+            self.send_note(key, false);
+        }
         if shared.restart_requested.swap(false, Ordering::AcqRel) {
+            self.all_notes_off();
             if let Some(mut e) = self.engine.take() {
                 e.stop(&mut self.plugin);
             }
@@ -197,6 +212,7 @@ impl App {
                 Ok(e) => self.engine = Some(e),
                 Err(err) => self.flash(format!("restart failed: {err:#}")),
             }
+            self.note_input = self.plugin.note_input();
             self.reload_params();
         }
         if let Some(e) = &self.engine {
@@ -335,7 +351,59 @@ impl App {
         }
     }
 
+    fn on_key_release(&mut self, k: KeyEvent) {
+        if let KeyCode::Char(c) = k.code {
+            if let Some(key) = self.keyboard.release(c) {
+                self.send_note(key, false);
+            }
+        }
+    }
+
+    /// Note keys and octave keys. Returns true if the key was used.
+    fn on_note_key(&mut self, k: KeyEvent) -> bool {
+        if k.modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return false;
+        }
+        let KeyCode::Char(c) = k.code else {
+            return false;
+        };
+        match c.to_ascii_lowercase() {
+            'z' => self.keyboard.octave_down(),
+            'x' => self.keyboard.octave_up(),
+            c if notes::is_note_key(c) => {
+                if self.note_input == NoteInput::None {
+                    self.flash("this plugin doesn't take notes".into());
+                } else if let Some(key) = self.keyboard.press(c, Instant::now()) {
+                    self.send_note(key, true);
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn send_note(&mut self, key: i16, on: bool) {
+        if let Some(e) = &self.engine {
+            e.shared.send(HostEvent::Note {
+                key,
+                on,
+                velocity: notes::VELOCITY,
+            });
+        }
+    }
+
+    fn all_notes_off(&mut self) {
+        for key in self.keyboard.release_all() {
+            self.send_note(key, false);
+        }
+    }
+
     fn on_normal_key(&mut self, k: KeyEvent) {
+        if self.on_note_key(k) {
+            return;
+        }
         let size = if k.modifiers.contains(KeyModifiers::SHIFT) {
             StepSize::Fine
         } else if k
@@ -355,26 +423,23 @@ impl App {
                 self.apply_filter();
             }
             KeyCode::Esc => self.quit = true,
-            KeyCode::Up | KeyCode::Char('k') if n > 0 => {
-                self.table.select(Some(sel.saturating_sub(1)))
-            }
-            KeyCode::Down | KeyCode::Char('j') if n > 0 => {
-                self.table.select(Some((sel + 1).min(n - 1)))
-            }
+            KeyCode::Up if n > 0 => self.table.select(Some(sel.saturating_sub(1))),
+            KeyCode::Down if n > 0 => self.table.select(Some((sel + 1).min(n - 1))),
             KeyCode::PageUp if n > 0 => self.table.select(Some(sel.saturating_sub(10))),
             KeyCode::PageDown if n > 0 => self.table.select(Some((sel + 10).min(n - 1))),
-            KeyCode::Left | KeyCode::Char('h') => self.nudge(-1.0, size),
-            KeyCode::Right | KeyCode::Char('l') => self.nudge(1.0, size),
+            KeyCode::Left => self.nudge(-1.0, size),
+            KeyCode::Right => self.nudge(1.0, size),
             KeyCode::Home => self.set_selected(|r| r.info.min),
             KeyCode::End => self.set_selected(|r| r.info.max),
-            KeyCode::Char('d') => self.set_selected(|r| r.info.default),
+            KeyCode::Delete | KeyCode::Backspace => self.set_selected(|r| r.info.default),
+            KeyCode::Char(' ') => self.all_notes_off(),
             KeyCode::Enter => {
                 if self.selected_row().is_some_and(|r| !r.info.is_readonly()) {
                     self.mode = Mode::Edit(String::new());
                 }
             }
             KeyCode::Char('/') => self.mode = Mode::Filter(self.filter.clone()),
-            KeyCode::Char('L') => self.show_log = !self.show_log,
+            KeyCode::Tab => self.show_log = !self.show_log,
             _ => {}
         }
     }
@@ -460,7 +525,7 @@ impl App {
             value: v,
         };
         match &self.engine {
-            Some(e) if self.plugin.is_active() => e.shared.send(change),
+            Some(e) if self.plugin.is_active() => e.shared.send(HostEvent::Param(change)),
             _ => self.plugin.flush_inactive(&[change]),
         }
         let row = &mut self.rows[i];
@@ -481,7 +546,7 @@ impl App {
     fn draw(&mut self, f: &mut Frame) {
         let log_height = if self.show_log { 8 } else { 0 };
         let [header, body, log, footer] = Layout::vertical([
-            Constraint::Length(3),
+            Constraint::Length(4),
             Constraint::Min(3),
             Constraint::Length(log_height),
             Constraint::Length(1),
@@ -541,8 +606,29 @@ impl App {
             Span::styled(format!(" {} ", d.name), Style::new().bold()),
             Span::raw(format!("{} {} ", d.vendor, d.version)).dark_gray(),
         ]);
+        let playing: Vec<String> = self
+            .keyboard
+            .sounding()
+            .into_iter()
+            .map(notes::note_name)
+            .collect();
+        let line3 = if self.note_input == NoteInput::None {
+            Line::from(" no note input on this plugin").dark_gray()
+        } else {
+            Line::from(vec![
+                Span::raw(format!(" keys {}  ", self.keyboard.range())),
+                Span::raw(if notes::RELEASE_EVENTS.load(Ordering::Relaxed) {
+                    "z/x octave  space all off   "
+                } else {
+                    "z/x octave  space all off  (timed notes)   "
+                })
+                .dark_gray(),
+                Span::styled(playing.join(" "), Style::new().fg(Color::Magenta).bold()),
+            ])
+        };
         f.render_widget(
-            Paragraph::new(line2).block(Block::default().borders(Borders::ALL).title(title)),
+            Paragraph::new(vec![line2, line3])
+                .block(Block::default().borders(Borders::ALL).title(title)),
             area,
         );
     }
@@ -648,7 +734,7 @@ impl App {
         }
         let text = match &self.mode {
             Mode::Filter(s) => format!(" filter: {s}█   (Enter keep, Esc clear)"),
-            _ => " ↑↓ select  ←→ change  Shift fine  Ctrl coarse  Home/End min/max  d default  Enter type  / filter  L log  q quit".into(),
+            _ => " ↑↓ select  ←→ change  Shift fine  Ctrl coarse  Home/End min/max  Del default  Enter type  / filter  Tab log  q quit".into(),
         };
         f.render_widget(Paragraph::new(text).dark_gray(), area);
     }

@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use clap_sys::entry::clap_plugin_entry;
 use clap_sys::events::*;
 use clap_sys::ext::audio_ports::*;
+use clap_sys::ext::note_ports::*;
 use clap_sys::ext::params::*;
 use clap_sys::factory::plugin_factory::*;
 use clap_sys::host::clap_host;
@@ -36,8 +37,7 @@ const ID: &CStr = cstr!("org.lextrack.test-tone");
 
 struct Features([*const c_char; 3]);
 unsafe impl Sync for Features {}
-static FEATURES: Features =
-    Features([cptr!("instrument"), cptr!("synthesizer"), ptr::null()]);
+static FEATURES: Features = Features([cptr!("instrument"), cptr!("synthesizer"), ptr::null()]);
 
 static DESCRIPTOR: clap_plugin_descriptor = clap_plugin_descriptor {
     clap_version: CLAP_VERSION,
@@ -61,6 +61,7 @@ const P_PAN: clap_id = 4;
 const P_DETUNE: clap_id = 5;
 const P_PEAK: clap_id = 6;
 const P_HIDDEN: clap_id = 7;
+const P_SOURCE: clap_id = 8;
 
 struct ParamDef {
     id: clap_id,
@@ -139,6 +140,15 @@ const PARAMS: &[ParamDef] = &[
         flags: CLAP_PARAM_IS_READONLY,
     },
     ParamDef {
+        id: P_SOURCE,
+        name: "Source",
+        module: "Oscillator",
+        min: 0.0,
+        max: 1.0,
+        default: 1.0,
+        flags: AUTO | STEP | CLAP_PARAM_IS_ENUM,
+    },
+    ParamDef {
         id: P_HIDDEN,
         name: "Secret",
         module: "",
@@ -153,7 +163,9 @@ const WAVES: [&str; 3] = ["Sine", "Saw", "Square"];
 
 struct Plugin {
     raw: clap_plugin,
-    values: [AtomicU64; 8],
+    values: [AtomicU64; 9],
+    /// Keys held down, most recent last.
+    notes: Vec<i16>,
     sample_rate: f64,
     phase: f64,
 }
@@ -165,7 +177,7 @@ impl Plugin {
     fn set(&self, id: clap_id, v: f64) {
         self.values[id as usize].store(v.to_bits(), Ordering::Relaxed)
     }
-    fn apply_events(&self, events: *const clap_input_events) {
+    fn apply_events(&mut self, events: *const clap_input_events) {
         if events.is_null() {
             return;
         }
@@ -177,7 +189,16 @@ impl Plugin {
                 continue;
             }
             let h = unsafe { &*h };
-            if h.space_id == CLAP_CORE_EVENT_SPACE_ID && h.type_ == CLAP_EVENT_PARAM_VALUE {
+            if h.space_id != CLAP_CORE_EVENT_SPACE_ID {
+                continue;
+            }
+            if h.type_ == CLAP_EVENT_NOTE_ON || h.type_ == CLAP_EVENT_NOTE_OFF {
+                let e = unsafe { &*(h as *const _ as *const clap_event_note) };
+                self.notes.retain(|&k| k != e.key);
+                if h.type_ == CLAP_EVENT_NOTE_ON && self.notes.len() < self.notes.capacity() {
+                    self.notes.push(e.key);
+                }
+            } else if h.type_ == CLAP_EVENT_PARAM_VALUE {
                 let e = unsafe { &*(h as *const _ as *const clap_event_param_value) };
                 if let Some(def) = PARAMS.iter().find(|d| d.id == e.param_id) {
                     self.set(def.id, e.value.clamp(def.min, def.max));
@@ -229,7 +250,16 @@ unsafe extern "C" fn process(
     };
     let pan = s.get(P_PAN);
     let (gl, gr) = (gain * (1.0 - pan.max(0.0)), gain * (1.0 + pan.min(0.0)));
-    let freq = s.get(P_FREQ) * 2f64.powf(s.get(P_DETUNE).round() / 12.0);
+    let keyboard = s.get(P_SOURCE) >= 0.5;
+    let (gl, gr) = match s.notes.last() {
+        None if keyboard => (0.0, 0.0),
+        _ => (gl, gr),
+    };
+    let base = match s.notes.last() {
+        Some(&k) if keyboard => 440.0 * 2f64.powf((k as f64 - 69.0) / 12.0),
+        _ => s.get(P_FREQ),
+    };
+    let freq = base * 2f64.powf(s.get(P_DETUNE).round() / 12.0);
     let wave = s.get(P_WAVE).round() as i32;
     let inc = freq / s.sample_rate;
     let mut peak = 0.0f64;
@@ -258,6 +288,8 @@ unsafe extern "C" fn get_extension(_: *const clap_plugin, id: *const c_char) -> 
     let id = CStr::from_ptr(id);
     if id == CLAP_EXT_PARAMS {
         &EXT_PARAMS as *const _ as *const c_void
+    } else if id == CLAP_EXT_NOTE_PORTS {
+        &EXT_NOTE_PORTS as *const _ as *const c_void
     } else if id == CLAP_EXT_AUDIO_PORTS {
         &EXT_PORTS as *const _ as *const c_void
     } else {
@@ -327,6 +359,7 @@ fn format(id: clap_id, v: f64) -> String {
         P_PAN if v < 0.0 => format!("{:.0}% L", -v * 100.0),
         P_PAN => format!("{:.0}% R", v * 100.0),
         P_DETUNE => format!("{:+} st", v.round() as i32),
+        P_SOURCE => if v >= 0.5 { "Keyboard" } else { "Drone" }.to_string(),
         P_PEAK => format!("{:.1} dB", 20.0 * v.max(1e-6).log10()),
         _ => format!("{v:.3}"),
     }
@@ -417,6 +450,38 @@ unsafe extern "C" fn ports_get(
     true
 }
 
+// --- note ports ------------------------------------------------------------------
+
+static EXT_NOTE_PORTS: clap_plugin_note_ports = clap_plugin_note_ports {
+    count: Some(note_ports_count),
+    get: Some(note_ports_get),
+};
+
+unsafe extern "C" fn note_ports_count(_: *const clap_plugin, is_input: bool) -> u32 {
+    if is_input {
+        1
+    } else {
+        0
+    }
+}
+
+unsafe extern "C" fn note_ports_get(
+    _: *const clap_plugin,
+    index: u32,
+    is_input: bool,
+    info: *mut clap_note_port_info,
+) -> bool {
+    if !is_input || index != 0 {
+        return false;
+    }
+    let info = &mut *info;
+    info.id = 0;
+    info.supported_dialects = CLAP_NOTE_DIALECT_CLAP;
+    info.preferred_dialect = CLAP_NOTE_DIALECT_CLAP;
+    copy_str(&mut info.name, "Notes");
+    true
+}
+
 // --- factory / entry -------------------------------------------------------------
 
 static FACTORY: clap_plugin_factory = clap_plugin_factory {
@@ -470,6 +535,7 @@ unsafe extern "C" fn factory_create(
                 .map_or(0.0, |d| d.default);
             AtomicU64::new(default.to_bits())
         }),
+        notes: Vec::with_capacity(128),
         sample_rate: 48_000.0,
         phase: 0.0,
     }));

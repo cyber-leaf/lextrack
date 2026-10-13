@@ -17,6 +17,7 @@ macro_rules! cptr {
 
 mod discovery;
 mod engine;
+mod notes;
 mod plugin;
 mod ui;
 
@@ -51,9 +52,11 @@ OPTIONS:
 KEYS:
     Up/Down         Select a parameter       Left/Right   Change its value
     Shift+Left/Right  Fine step              Ctrl+Left/Right  Coarse step
-    Home/End        Minimum/maximum          d            Default value
+    Home/End        Minimum/maximum          Del/Backspace  Default value
     Enter           Type a value             /            Filter by name
-    PgUp/PgDn       Jump 10 rows             L            Show plugin log
+    PgUp/PgDn       Jump 10 rows             Tab          Show plugin log
+    a s d f g h j k l ; '   Play white keys  w e t y u o p  Play black keys
+    z / x           Octave down / up         Space        Stop all notes
     q / Esc         Quit
 ";
 
@@ -244,6 +247,7 @@ impl TtyGuard {
             terminal::EnterAlternateScreen,
             ratatui::crossterm::cursor::Hide
         )?;
+        enable_key_releases();
         let guard = TtyGuard {
             #[cfg(unix)]
             saved: redirect_console(),
@@ -284,7 +288,37 @@ impl Drop for TtyGuard {
     }
 }
 
+/// Ask the terminal to report key releases, so notes stop when their key is
+/// let go. Terminals that speak the kitty keyboard protocol (kitty, foot,
+/// WezTerm, Ghostty, Alacritty...) support this; others don't,
+/// and notes then stop on a timer instead. The Windows console always reports
+/// releases.
+fn enable_key_releases() {
+    use ratatui::crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+    let supported = if cfg!(windows) {
+        true
+    } else if terminal::supports_keyboard_enhancement().unwrap_or(false) {
+        execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+            )
+        )
+        .is_ok()
+    } else {
+        false
+    };
+    notes::RELEASE_EVENTS.store(supported, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn restore_terminal_raw() {
+    if !cfg!(windows) && notes::RELEASE_EVENTS.load(std::sync::atomic::Ordering::Relaxed) {
+        let _ = execute!(
+            std::io::stdout(),
+            ratatui::crossterm::event::PopKeyboardEnhancementFlags
+        );
+    }
     let _ = execute!(
         std::io::stdout(),
         terminal::LeaveAlternateScreen,

@@ -13,7 +13,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SizedSample};
 
 use crate::plugin::{
-    discard_output_events, mark_audio_thread, EventList, HostShared, ParamChange, PluginInstance,
+    discard_output_events, mark_audio_thread, EventList, HostEvent, HostShared, PluginInstance,
     RawPlugin,
 };
 
@@ -23,7 +23,7 @@ pub const MAX_BLOCK: usize = 1024;
 /// State shared between the UI and the audio thread.
 pub struct EngineShared {
     /// Parameter changes waiting for the next audio block.
-    pub queue: Mutex<Vec<ParamChange>>,
+    pub queue: Mutex<Vec<HostEvent>>,
     stop: AtomicBool,
     stopped: AtomicBool,
     /// Peak output level of the last blocks, as f32 bits. Decays in the UI.
@@ -32,9 +32,9 @@ pub struct EngineShared {
 }
 
 impl EngineShared {
-    pub fn send(&self, change: ParamChange) {
+    pub fn send(&self, event: HostEvent) {
         if let Ok(mut q) = self.queue.lock() {
-            q.push(change);
+            q.push(event);
         }
     }
 
@@ -107,7 +107,7 @@ impl Processor {
         Processor {
             plugin: plugin.raw(),
             shared,
-            events: EventList::new(),
+            events: EventList::new(plugin.note_input()),
             _in_data: in_data,
             out_data,
             _in_ptrs: in_ptrs,
@@ -235,9 +235,7 @@ impl Engine {
         let config: cpal::StreamConfig = supported.into();
         let sample_rate = config.sample_rate.0;
         let channels = config.channels as usize;
-        let output_name = device
-            .name()
-            .unwrap_or_else(|_| "default output".into());
+        let output_name = device.name().unwrap_or_else(|_| "default output".into());
 
         plugin.activate(sample_rate as f64, 1, MAX_BLOCK as u32)?;
         let processor = Processor::new(plugin, shared.clone());

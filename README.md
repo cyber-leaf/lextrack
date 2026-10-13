@@ -55,19 +55,43 @@ Folders scanned: `~/.clap`, `/usr/lib/clap` and `/usr/local/lib/clap` on Linux; 
 | Shift + ← / → | Fine: 0.1% of the range |
 | Ctrl + ← / → | Coarse: 10% of the range |
 | Home / End | Minimum / maximum |
-| d | Reset to the default value |
+| Delete / Backspace | Reset to the default value |
 | Enter | Type a value, for example `440` or `-6 dB`. The plugin parses the text |
 | / | Filter parameters by name; Esc clears the filter |
 | PgUp / PgDn | Move 10 rows |
-| L | Show or hide the plugin's log messages |
+| Tab | Show or hide the plugin's log messages |
 | q / Esc | Quit |
 
 Read-only parameters (meters) are shown greyed out and update live. Hidden parameters are not shown.
+
+### Playing notes
+
+The keyboard works like a piano laid over the home row:
+
+```
+ w e   t y u   o p          black keys   C#  D#    F#  G#  A#    C#  D#
+a s d f g h j k l ; '       white keys  C  D  E  F  G  A  B  C  D  E  F
+```
+
+| Key | Action |
+| --- | --- |
+| a s d f g h j k l ; ' | White keys, starting from C |
+| w e t y u o p | Black keys |
+| z / x | One octave down / up. The header shows the current range; it starts at C4–F5 (`a` is middle C) |
+| Space | Stop all notes |
+
+The header shows the notes that are sounding. Notes go to the plugin's first note input as CLAP note events, or as MIDI when the plugin only accepts MIDI. For plugins with no note input, the header says so.
+
+**Releasing notes.** Most terminals don't report when a key is let go. lextrack handles this in two ways:
+
+- In terminals that support the kitty keyboard protocol (kitty, foot, WezTerm, Ghostty, Alacritty), and in the Windows console, a note sounds for exactly as long as you hold the key.
+- Everywhere else (GNOME Terminal, xterm, tmux and others), the header says *timed notes*. A tap plays for 0.7 s. Holding the key down keeps the note going through the keyboard's auto-repeat, and the note stops about 0.15 s after you let go. A key can't re-strike its own note until that note has stopped.
 
 ## How it works
 
 - `src/plugin.rs` loads the `.clap` binary and creates the plugin instance. It also implements the host side of the CLAP API (`clap.params`, `clap.log`, `clap.thread-check`, `clap.state`, `clap.audio-ports`).
 - `src/engine.rs` activates the plugin and calls `process` from the sound card callback (via cpal). If no device is available, a silent timer thread calls it instead. Parameter changes go to the plugin as `CLAP_EVENT_PARAM_VALUE` events in the next audio block.
+- `src/notes.rs` maps computer keys to notes and decides when they stop.
 - `src/ui.rs` holds the terminal UI (ratatui). Values shown on screen are re-read from the plugin about 30 times a second, so changes the plugin makes itself show up too.
 - `src/discovery.rs` finds plugins in the standard CLAP folders.
 - `test-plugin/` is a tiny test-tone CLAP plugin used for testing. Build it with `cargo build -p lextrack-test-plugin`, then copy `target/debug/liblextrack_test_plugin.so` to `~/.clap/TestTone.clap`.
@@ -77,5 +101,5 @@ On Linux and macOS, anything a plugin prints to the console goes to `lextrack-pl
 ## Not supported yet
 
 - No plugin GUI windows: control is terminal only.
-- No audio or MIDI input, so effects get silence and instruments get no notes.
+- No audio input or external MIDI input, so effects get silence. Instruments can be played from the computer keyboard.
 - Plugin state is not saved or loaded.
