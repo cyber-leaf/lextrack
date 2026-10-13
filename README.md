@@ -20,10 +20,10 @@ A terminal host for [CLAP](https://cleveraudio.org) audio plugins. It loads a pl
 
 ## Build
 
-You need Rust (https://rustup.rs). On Linux you also need the ALSA headers:
+You need Rust 1.75 or newer. Ubuntu 24.04's packaged `cargo` is new enough, as is anything from https://rustup.rs. On Linux you also need the ALSA headers:
 
 ```bash
-sudo apt install build-essential pkg-config libasound2-dev   # Debian/Ubuntu
+sudo apt install build-essential pkg-config libasound2-dev cargo   # Debian/Ubuntu
 sudo dnf install gcc pkgconf alsa-lib-devel                  # Fedora
 sudo pacman -S base-devel alsa-lib                           # Arch
 

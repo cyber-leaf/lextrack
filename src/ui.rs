@@ -31,8 +31,6 @@ pub fn pick_plugin<B: Backend>(
     term: &mut Terminal<B>,
     plugins: &[PluginDescriptor],
 ) -> Result<Option<usize>>
-where
-    B::Error: Send + Sync + 'static,
 {
     let mut state = ListState::default().with_selected(Some(0));
     loop {
@@ -152,8 +150,6 @@ impl App {
     }
 
     pub fn run<B: Backend>(&mut self, term: &mut Terminal<B>) -> Result<()>
-    where
-        B::Error: Send + Sync + 'static,
     {
         while !self.quit {
             self.service_host();

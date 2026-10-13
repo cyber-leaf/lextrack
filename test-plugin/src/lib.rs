@@ -3,6 +3,20 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+/// `&'static CStr` from a string literal (C-string literals need Rust 1.77).
+macro_rules! cstr {
+    ($s:literal) => {
+        unsafe { ::std::ffi::CStr::from_bytes_with_nul_unchecked(concat!($s, "\0").as_bytes()) }
+    };
+}
+
+/// A `*const c_char` to a NUL-terminated string literal.
+macro_rules! cptr {
+    ($s:literal) => {
+        concat!($s, "\0").as_ptr() as *const ::std::ffi::c_char
+    };
+}
+
 use std::ffi::{c_char, c_void, CStr};
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,23 +32,23 @@ use clap_sys::plugin::*;
 use clap_sys::process::*;
 use clap_sys::version::CLAP_VERSION;
 
-const ID: &CStr = c"org.lextrack.test-tone";
+const ID: &CStr = cstr!("org.lextrack.test-tone");
 
 struct Features([*const c_char; 3]);
 unsafe impl Sync for Features {}
 static FEATURES: Features =
-    Features([c"instrument".as_ptr(), c"synthesizer".as_ptr(), ptr::null()]);
+    Features([cptr!("instrument"), cptr!("synthesizer"), ptr::null()]);
 
 static DESCRIPTOR: clap_plugin_descriptor = clap_plugin_descriptor {
     clap_version: CLAP_VERSION,
     id: ID.as_ptr(),
-    name: c"Test Tone".as_ptr(),
-    vendor: c"lextrack".as_ptr(),
-    url: c"".as_ptr(),
-    manual_url: c"".as_ptr(),
-    support_url: c"".as_ptr(),
-    version: c"0.1.0".as_ptr(),
-    description: c"Sine/saw/square test tone".as_ptr(),
+    name: cptr!("Test Tone"),
+    vendor: cptr!("lextrack"),
+    url: cptr!(""),
+    manual_url: cptr!(""),
+    support_url: cptr!(""),
+    version: cptr!("0.1.0"),
+    description: cptr!("Sine/saw/square test tone"),
     features: &FEATURES.0 as *const _ as *const *const c_char,
 };
 

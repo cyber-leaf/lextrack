@@ -2,15 +2,16 @@
 name = "lextrack"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.75"
 description = "A terminal host for CLAP audio plugins"
 license = "MIT"
 
 [dependencies]
 anyhow = "1"
 clap-sys = "0.5"
-cpal = "0.18"
-libloading = "0.9"
-ratatui = "0.30"
+cpal = "0.15"
+libloading = "0.8"
+ratatui = "0.29"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

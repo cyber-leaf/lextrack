@@ -233,11 +233,10 @@ impl Engine {
         let supported = device.default_output_config()?;
         let format = supported.sample_format();
         let config: cpal::StreamConfig = supported.into();
-        let sample_rate = config.sample_rate;
+        let sample_rate = config.sample_rate.0;
         let channels = config.channels as usize;
         let output_name = device
-            .description()
-            .map(|d| d.to_string())
+            .name()
             .unwrap_or_else(|_| "default output".into());
 
         plugin.activate(sample_rate as f64, 1, MAX_BLOCK as u32)?;
@@ -334,7 +333,7 @@ where
     T: SizedSample + FromSample<f32>,
 {
     let stream = device.build_output_stream(
-        config,
+        &config,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| p.render(data, channels),
         move |err| log.push_log(format!("[host] audio stream error: {err}")),
         None,

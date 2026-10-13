@@ -1,5 +1,20 @@
 //! lextrack: a terminal host for CLAP audio plugins.
 
+/// `&'static CStr` from a string literal (C-string literals need Rust 1.77).
+#[allow(unused_macros)]
+macro_rules! cstr {
+    ($s:literal) => {
+        unsafe { ::std::ffi::CStr::from_bytes_with_nul_unchecked(concat!($s, "\0").as_bytes()) }
+    };
+}
+
+/// A `*const c_char` to a NUL-terminated string literal.
+macro_rules! cptr {
+    ($s:literal) => {
+        concat!($s, "\0").as_ptr() as *const ::std::ffi::c_char
+    };
+}
+
 mod discovery;
 mod engine;
 mod plugin;
