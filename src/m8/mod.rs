@@ -11,3 +11,5 @@ pub mod sampler;
 pub mod screen;
 pub mod sequencer;
 pub mod ui;
+#[cfg(feature = "window")]
+pub mod window;

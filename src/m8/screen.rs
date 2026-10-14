@@ -1,6 +1,6 @@
-//! A fixed 40x24 character screen with the M8's colour roles, drawn into
-//! the middle of the terminal. Views write text at M8-style grid positions;
-//! the screen takes care of scaling nothing and centring everything.
+//! A fixed 40x24 character screen with the M8's colour roles. Views write
+//! text at M8-style grid positions; the screen is then drawn into the middle
+//! of the terminal, or as pixels into the native window.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -29,7 +29,12 @@ pub enum Role {
 
 impl Role {
     pub fn color(self) -> Color {
-        let (r, g, b) = match self {
+        let (r, g, b) = self.rgb();
+        Color::Rgb(r, g, b)
+    }
+
+    pub fn rgb(self) -> (u8, u8, u8) {
+        match self {
             Role::Background => (0, 0, 0),
             Role::Empty => (30, 30, 40),
             Role::Info => (96, 96, 142),
@@ -42,8 +47,7 @@ impl Role {
             Role::MeterLow => (0, 255, 80),
             Role::MeterMid => (255, 224, 0),
             Role::MeterPeak => (255, 48, 112),
-        };
-        Color::Rgb(r, g, b)
+        }
     }
 }
 
@@ -93,6 +97,14 @@ impl Screen {
                 c.fg = Role::Background;
             }
         }
+    }
+
+    /// The character at column `x`, row `y` and its text and background
+    /// colours.
+    #[cfg(feature = "window")]
+    pub fn cell(&self, x: usize, y: usize) -> (char, Role, Role) {
+        let c = self.cells[y][x];
+        (c.ch, c.fg, c.bg)
     }
 
     /// The text on row `y`, for tests.

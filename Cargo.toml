@@ -3,7 +3,7 @@ name = "lextrack"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-description = "A terminal host for CLAP audio plugins"
+description = "An M8-style tracker that plays CLAP plugins"
 license = "MIT"
 
 [dependencies]
@@ -12,6 +12,14 @@ clap-sys = "0.5"
 cpal = "0.15"
 libloading = "0.8"
 ratatui = "0.29"
+softbuffer = { version = "0.4", optional = true }
+winit = { version = "0.30", optional = true }
+font8x8 = { version = "0.3", optional = true, default-features = false }
+
+[features]
+# The native window UI. Without it lextrack only has the terminal UI.
+default = ["window"]
+window = ["dep:font8x8", "dep:softbuffer", "dep:winit"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

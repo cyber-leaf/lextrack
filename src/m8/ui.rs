@@ -497,14 +497,11 @@ impl App {
         app
     }
 
+    /// Run in the terminal until the user quits.
     pub fn run<B: Backend>(&mut self, term: &mut Terminal<B>) -> Result<()> {
         while !self.quit {
-            self.tick();
-            term.draw(|f| {
-                let mut s = Screen::new();
-                self.draw(&mut s);
-                s.render(f.area(), f.buffer_mut());
-            })?;
+            let s = self.frame();
+            term.draw(|f| s.render(f.area(), f.buffer_mut()))?;
             if event::poll(Duration::from_millis(25))? {
                 loop {
                     if let Event::Key(k) = event::read()? {
@@ -517,6 +514,25 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// Do the housekeeping that's due and draw the screen.
+    pub fn frame(&mut self) -> Screen {
+        self.tick();
+        let mut s = Screen::new();
+        self.draw(&mut s);
+        s
+    }
+
+    /// A key from the window, spelled like a terminal key.
+    #[cfg(feature = "window")]
+    pub fn key_event(&mut self, k: KeyEvent) {
+        self.key(k);
+    }
+
+    #[cfg(feature = "window")]
+    pub fn wants_quit(&self) -> bool {
+        self.quit
     }
 
     pub fn shutdown(mut self) {
