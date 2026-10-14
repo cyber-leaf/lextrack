@@ -232,6 +232,11 @@ pub struct SampleBank {
 }
 
 impl SampleBank {
+    /// Drop a file from the cache, after it changed on disk.
+    pub fn forget(&mut self, path: &Path) {
+        self.cache.remove(path);
+    }
+
     pub fn get(&mut self, path: &Path) -> Result<Arc<Sample>, String> {
         self.cache
             .entry(path.to_path_buf())

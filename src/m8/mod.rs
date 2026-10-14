@@ -6,6 +6,7 @@ pub mod format;
 pub mod input;
 pub mod instruments;
 pub mod rack;
+pub mod recorder;
 pub mod sampler;
 pub mod screen;
 pub mod sequencer;
