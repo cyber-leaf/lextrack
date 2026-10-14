@@ -17,6 +17,7 @@ use cpal::{FromSample, Sample, SizedSample};
 
 use super::format::{Song, INSTRUMENTS, TRACKS};
 use super::instruments::{InstrumentMap, PluginRef};
+use super::recorder::Capture;
 use super::sampler::{self, SamplerEngine, SamplerSet};
 use super::sequencer::{samples_per_tick, Pos, SeqEvent, Sequencer};
 use crate::audio::{find_device, pick_config, MAX_BLOCK};
@@ -118,6 +119,7 @@ enum Command {
     Param(u8, ParamChange),
     Samplers(Arc<SamplerSet>),
     Audition(Option<Arc<sampler::Sample>>),
+    Capture(Option<Arc<Capture>>),
 }
 
 /// State shared between the UI and the audio thread.
@@ -228,6 +230,11 @@ impl RackShared {
     /// Hand the audio thread new samples for the built-in sampler.
     pub fn set_samplers(&self, set: Arc<SamplerSet>) {
         self.send(Command::Samplers(set));
+    }
+
+    /// Feed the master output to a recorder, or stop (`None`).
+    pub fn set_capture(&self, capture: Option<Arc<Capture>>) {
+        self.send(Command::Capture(capture));
     }
 
     /// Play a sample file as it is, or stop the one playing.
@@ -379,6 +386,8 @@ pub struct Processor {
     seq_events: Vec<SeqEvent>,
     mix: [Vec<f32>; 2],
     steady_time: i64,
+    /// Where the master output is being recorded, if anywhere.
+    capture: Option<Arc<Capture>>,
 }
 
 unsafe impl Send for Processor {}
@@ -408,6 +417,7 @@ impl Processor {
             seq_events: Vec::with_capacity(64),
             mix: [vec![0.0; MAX_BLOCK], vec![0.0; MAX_BLOCK]],
             steady_time: 0,
+            capture: None,
         }
     }
 
@@ -485,6 +495,7 @@ impl Processor {
                     }),
                     Command::Samplers(set) => self.sampler.set_samplers(set),
                     Command::Audition(sample) => self.sampler.audition(sample),
+                    Command::Capture(c) => self.capture = c,
                     Command::Param(inst, change) => {
                         if let Some(i) = self.slot_of[inst as usize] {
                             self.slots[i].events.push_at(HostEvent::Param(change), 0);
@@ -517,6 +528,10 @@ impl Processor {
                     }
                 }
             }
+        }
+        if let Some(c) = &self.capture {
+            let [l, r] = &self.mix;
+            c.push(frames, |i| (l[i], r[i]));
         }
         self.steady_time += frames as i64;
         self.publish();
@@ -823,22 +838,29 @@ pub fn render_wav(
         .join()
         .map_err(|_| anyhow!("the audio thread panicked"))?;
     deactivate(slots);
-    write_wav(path, &samples, sample_rate)?;
+    write_wav(path, &samples, 2, sample_rate)?;
     Ok(())
 }
 
-fn write_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
+/// Write interleaved samples as a 16-bit PCM WAV file.
+pub(crate) fn write_wav(
+    path: &Path,
+    samples: &[f32],
+    channels: u16,
+    sample_rate: u32,
+) -> Result<()> {
     let data_len = (samples.len() * 2) as u32;
+    let align = 2 * channels;
     let mut b = Vec::with_capacity(44 + data_len as usize);
     b.extend_from_slice(b"RIFF");
     b.extend_from_slice(&(36 + data_len).to_le_bytes());
     b.extend_from_slice(b"WAVEfmt ");
     b.extend_from_slice(&16u32.to_le_bytes());
     b.extend_from_slice(&1u16.to_le_bytes()); // PCM
-    b.extend_from_slice(&2u16.to_le_bytes()); // channels
+    b.extend_from_slice(&channels.to_le_bytes());
     b.extend_from_slice(&sample_rate.to_le_bytes());
-    b.extend_from_slice(&(sample_rate * 4).to_le_bytes());
-    b.extend_from_slice(&4u16.to_le_bytes());
+    b.extend_from_slice(&(sample_rate * align as u32).to_le_bytes());
+    b.extend_from_slice(&align.to_le_bytes());
     b.extend_from_slice(&16u16.to_le_bytes());
     b.extend_from_slice(b"data");
     b.extend_from_slice(&data_len.to_le_bytes());

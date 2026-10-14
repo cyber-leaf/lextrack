@@ -64,3 +64,28 @@ pub(crate) fn pick_config(
         .map(|c| c.with_sample_rate(cpal::SampleRate(rate)))
         .ok_or_else(|| anyhow!("the device doesn't support {rate} Hz"))
 }
+
+/// Input devices of the default audio host, by name.
+pub fn input_devices() -> Vec<String> {
+    let host = cpal::default_host();
+    let mut names: Vec<String> = match host.input_devices() {
+        Ok(devs) => devs.filter_map(|d| d.name().ok()).collect(),
+        Err(_) => vec![],
+    };
+    names.dedup();
+    names
+}
+
+pub(crate) fn find_input_device(name: Option<&str>) -> Result<cpal::Device> {
+    let host = cpal::default_host();
+    match name {
+        None => host
+            .default_input_device()
+            .ok_or_else(|| anyhow!("no default input device")),
+        Some(name) => host
+            .input_devices()
+            .context("can't list input devices")?
+            .find(|d| d.name().is_ok_and(|n| n == name))
+            .ok_or_else(|| anyhow!("input device \"{name}\" not found")),
+    }
+}

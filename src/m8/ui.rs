@@ -25,6 +25,7 @@ use super::format::{
 use super::input::{Button, Input, Keys, Press, RELEASE_EVENTS};
 use super::instruments::{InstrumentMap, PluginRef};
 use super::rack::{load_slots_reusing, render_wav, wanted_instruments, Rack, Slot};
+use super::recorder::{self, Capture, Source, Take, SOURCES};
 use super::sampler::{
     self, card_root, resolve_sample_path, sample_path_for, SampleBank, SamplerSet, FILTERS,
     LFO_SHAPES, LFO_TRIGGERS, LIMITS, MOD_DESTS, PLAY_MODES,
@@ -238,6 +239,53 @@ enum Modal {
 enum TextTarget {
     SongName,
     InstrumentName(u8),
+    RecordingFile,
+}
+
+/// Rows of the sample recording screen.
+const REC_ROWS: [&str; 8] = [
+    "START", "SRC", "DEVICE", "VOL", "ARM", "PLAY", "NAME", "SAVE",
+];
+const REC_START: usize = 0;
+const REC_SRC: usize = 1;
+const REC_DEVICE: usize = 2;
+const REC_VOL: usize = 3;
+const REC_ARM: usize = 4;
+const REC_PLAY: usize = 5;
+const REC_NAME: usize = 6;
+const REC_SAVE: usize = 7;
+
+/// The sample recording screen, opened from REC. on a sampler's SAMPLE row.
+struct Recording {
+    instrument: u8,
+    row: usize,
+    source: Source,
+    /// Input device; `None` is the system default.
+    device: Option<String>,
+    devices: Vec<String>,
+    /// Input gain: 80 is unity.
+    vol: u8,
+    /// Level that starts the recording; 00 starts it at once.
+    arm: u8,
+    /// Song row to play from while recording.
+    play: Option<u8>,
+    name: String,
+    capture: Arc<Capture>,
+    input: Option<recorder::Input>,
+    problem: Option<String>,
+    take: Option<Take>,
+    /// The finished take, for listening to.
+    sample: Option<Arc<sampler::Sample>>,
+    /// Handed back and forth with the capture.
+    spare: Vec<f32>,
+    meter: f32,
+    started_song: bool,
+}
+
+impl Recording {
+    fn gain(&self) -> f32 {
+        self.vol as f32 / 128.0
+    }
 }
 
 /// Instrument view rows before the plugin parameters.
@@ -357,6 +405,9 @@ pub struct App {
     table: usize,
     groove: usize,
     project_col: usize,
+    /// 0 for the sample name, 1 for REC. on a sampler's SAMPLE row.
+    sample_col: usize,
+    recording: Option<Box<Recording>>,
     render_seconds: u32,
     devices: Vec<String>,
 
@@ -411,6 +462,8 @@ impl App {
             table: 0,
             groove: 0,
             project_col: 0,
+            sample_col: 0,
+            recording: None,
             render_seconds: 60,
             devices: Vec::new(),
             last: HashMap::new(),
@@ -510,6 +563,7 @@ impl App {
         if let Some(r) = &self.rack {
             self.meter = r.shared.take_peak().max(self.meter * 0.8);
         }
+        self.tick_recording();
         let now = Instant::now();
         self.param_hold.retain(|_, (_, until)| *until > now);
     }
@@ -596,6 +650,9 @@ impl App {
         ) {
             Ok((rack, problem)) => {
                 rack.shared.set_mutes(self.muted, self.soloed);
+                if let Some(rec) = self.recording.as_ref().filter(|r| !r.source.is_input()) {
+                    rack.shared.set_capture(Some(rec.capture.clone()));
+                }
                 if let Some(row) = resume {
                     rack.shared.play_from(row);
                 }
@@ -619,7 +676,7 @@ impl App {
         match self.keys.translate(k, releases) {
             Input::Quit => self.quit = true,
             Input::Press(p) => {
-                if self.modal.is_some() {
+                if self.modal.is_some() && self.recording.is_none() {
                     self.modal_press(p);
                 } else {
                     self.press(p);
@@ -630,6 +687,9 @@ impl App {
     }
 
     fn press(&mut self, p: Press) {
+        if self.recording.is_some() {
+            return self.record_press(p);
+        }
         let h = p.held;
         if p.button == Button::Play {
             return self.play(p);
@@ -695,6 +755,13 @@ impl App {
             match b {
                 Button::Left => self.project_col = self.project_col.saturating_sub(1),
                 Button::Right => self.project_col = (self.project_col + 1).min(2),
+                _ => {}
+            }
+        }
+        if self.view == View::Instrument && c.row == 2 && self.is_sampler(self.instrument) {
+            match b {
+                Button::Left => self.sample_col = 0,
+                Button::Right => self.sample_col = 1,
                 _ => {}
             }
         }
@@ -1457,6 +1524,8 @@ impl App {
                     target: TextTarget::InstrumentName(n),
                 })
             }
+            2 if delta == 0 && sampler && self.sample_col == 1 => self.open_recorder(n),
+            2 if sampler && self.sample_col == 1 => {}
             2 if delta == 0 && sampler => self.open_sample_browser(n),
             2 if sampler => self.step_sample(n, delta),
             2 if delta == 0 => self.open_plugin_browser(n),
@@ -1977,6 +2046,278 @@ impl App {
         }
     }
 
+    // --- sample recording ---------------------------------------------------------
+
+    /// Open the recording screen for sampler `instrument`.
+    fn open_recorder(&mut self, instrument: u8) {
+        let (root, _) = self.sample_dirs();
+        let capture = Capture::new();
+        let rec = Recording {
+            instrument,
+            row: REC_START,
+            source: Source::LeftRight,
+            device: None,
+            devices: audio::input_devices(),
+            vol: 0x80,
+            arm: 0,
+            play: None,
+            name: recorder::next_name(&recorder::recordings_dir(&root)),
+            capture,
+            input: None,
+            problem: None,
+            take: None,
+            sample: None,
+            spare: Vec::new(),
+            meter: 0.0,
+            started_song: false,
+        };
+        self.recording = Some(Box::new(rec));
+        self.connect_recording();
+    }
+
+    /// Point the capture at the chosen source: open the input device, or
+    /// tap the master output.
+    fn connect_recording(&mut self) {
+        let Some(rec) = self.recording.as_mut() else {
+            return;
+        };
+        rec.input = None;
+        rec.problem = None;
+        rec.capture.set_source(rec.source);
+        rec.capture.set_gain(rec.gain());
+        if rec.source.is_input() {
+            match recorder::open_input(rec.device.as_deref(), rec.capture.clone()) {
+                Ok(i) => rec.input = Some(i),
+                Err(e) => rec.problem = Some(format!("{e:#}")),
+            }
+        }
+        let tap = (!rec.source.is_input()).then(|| rec.capture.clone());
+        if let Some(r) = &self.rack {
+            r.shared.set_capture(tap);
+        }
+    }
+
+    fn close_recorder(&mut self) {
+        self.stop_recording();
+        if let Some(r) = &self.rack {
+            r.shared.set_capture(None);
+            r.shared.audition(None);
+        }
+        self.recording = None;
+    }
+
+    /// The sample rate recordings from the current source come at.
+    fn recording_rate(&self) -> Option<u32> {
+        let rec = self.recording.as_ref()?;
+        match &rec.input {
+            Some(i) => Some(i.sample_rate),
+            None if !rec.source.is_input() => self.rack.as_ref().map(|r| r.sample_rate),
+            None => None,
+        }
+    }
+
+    fn start_recording(&mut self) {
+        let Some(rate) = self.recording_rate() else {
+            return self.flash("NO AUDIO SOURCE TO RECORD");
+        };
+        let Some(rec) = self.recording.as_mut() else {
+            return;
+        };
+        let room = rate as usize / 2;
+        rec.take = Some(Take::new(rate, rec.source.is_mono()));
+        rec.sample = None;
+        rec.spare = Vec::with_capacity(room * 2);
+        rec.capture.start(rec.arm as f32 / 255.0, room);
+        rec.started_song = false;
+        if let Some(r) = &self.rack {
+            r.shared.audition(None);
+            if let Some(row) = rec.play {
+                r.shared.play_from(row as usize);
+                rec.started_song = true;
+            }
+        }
+    }
+
+    fn stop_recording(&mut self) {
+        let Some(rec) = self.recording.as_mut() else {
+            return;
+        };
+        if !rec.capture.is_recording() {
+            return;
+        }
+        rec.capture.stop();
+        if rec.started_song {
+            if let Some(r) = &self.rack {
+                r.shared.stop_song();
+            }
+            rec.started_song = false;
+        }
+        Self::drain_recording(rec);
+        match rec.take.as_ref() {
+            Some(t) if t.frames() > 0 => rec.sample = Some(Arc::new(t.to_sample())),
+            _ => {
+                rec.take = None;
+                self.flash("NOTHING RECORDED");
+            }
+        }
+    }
+
+    fn drain_recording(rec: &mut Recording) {
+        rec.capture.drain(&mut rec.spare);
+        if let Some(t) = rec.take.as_mut() {
+            t.extend(&rec.spare);
+        }
+        rec.spare.clear();
+    }
+
+    fn tick_recording(&mut self) {
+        let Some(rec) = self.recording.as_mut() else {
+            return;
+        };
+        rec.meter = rec.capture.take_peak().max(rec.meter * 0.8);
+        if !rec.capture.is_recording() {
+            return;
+        }
+        Self::drain_recording(rec);
+        let full = rec
+            .take
+            .as_ref()
+            .is_some_and(|t| t.seconds() >= recorder::MAX_SECONDS as f64);
+        if full {
+            self.stop_recording();
+            self.flash("LONGEST RECORDING REACHED");
+        }
+    }
+
+    /// Write the take into the recordings folder and load it into the
+    /// instrument.
+    fn save_recording(&mut self) {
+        let (root, _) = self.sample_dirs();
+        let Some(rec) = self.recording.as_ref() else {
+            return;
+        };
+        if rec.capture.is_recording() {
+            return self.flash("STOP THE RECORDING FIRST");
+        }
+        let Some(take) = rec.take.as_ref() else {
+            return self.flash("NOTHING TO SAVE YET");
+        };
+        let path = recorder::wav_path(&recorder::recordings_dir(&root), &rec.name);
+        if path.exists() {
+            let again = matches!(self.confirm, Some((at, "OVERWRITE")) if at.elapsed() < Duration::from_secs(3));
+            if !again {
+                self.confirm = Some((Instant::now(), "OVERWRITE"));
+                return self.flash(format!("{} EXISTS. EDIT AGAIN TO OVERWRITE", rec.name));
+            }
+            self.confirm = None;
+        }
+        if let Err(e) = take.save(&path) {
+            return self.flash(format!("SAVE FAILED: {e:#}"));
+        }
+        let instrument = rec.instrument;
+        self.bank.forget(&path);
+        self.close_recorder();
+        self.sample_col = 0;
+        self.choose_sample(instrument, &path);
+        self.flash(format!("SAVED {}", file_name(&path)));
+    }
+
+    fn record_press(&mut self, p: Press) {
+        let Some(rec) = self.recording.as_mut() else {
+            return;
+        };
+        let h = p.held;
+        let busy = rec.capture.is_recording();
+        match p.button {
+            Button::Up if h.none() => rec.row = rec.row.saturating_sub(1),
+            Button::Down if h.none() => rec.row = (rec.row + 1).min(REC_ROWS.len() - 1),
+            Button::Option if h.edit => match rec.row {
+                REC_ARM => rec.arm = 0,
+                REC_PLAY => rec.play = None,
+                REC_VOL => {
+                    rec.vol = 0x80;
+                    rec.capture.set_gain(rec.gain());
+                }
+                _ => {}
+            },
+            Button::Edit if h.option => {
+                if rec.row == REC_ARM {
+                    rec.arm = 0;
+                } else if rec.row == REC_PLAY {
+                    rec.play = None;
+                }
+            }
+            Button::Option if h.none() => {
+                if busy {
+                    return self.stop_recording();
+                }
+                let unsaved = rec.take.is_some();
+                let again = matches!(self.confirm, Some((at, "DISCARD")) if at.elapsed() < Duration::from_secs(3));
+                if unsaved && !again {
+                    self.confirm = Some((Instant::now(), "DISCARD"));
+                    return self.flash("NOT SAVED. OPTION AGAIN TO DISCARD");
+                }
+                self.confirm = None;
+                self.close_recorder();
+            }
+            Button::Edit if h.none() => match rec.row {
+                REC_START if busy => self.stop_recording(),
+                REC_START => self.start_recording(),
+                REC_NAME => {
+                    self.modal = Some(Modal::Text {
+                        label: "NAME",
+                        value: rec.name.clone(),
+                        target: TextTarget::RecordingFile,
+                    })
+                }
+                REC_SAVE => self.save_recording(),
+                _ => {}
+            },
+            b if b.is_direction() && h.edit => {
+                let delta = match b {
+                    Button::Left => -1,
+                    Button::Right => 1,
+                    Button::Down => -16,
+                    _ => 16,
+                };
+                match rec.row {
+                    REC_SRC if !busy => {
+                        rec.source = cycle(&SOURCES, &rec.source, delta);
+                        self.connect_recording();
+                    }
+                    REC_DEVICE if !busy && rec.source.is_input() => {
+                        let mut opts: Vec<Option<String>> = vec![None];
+                        opts.extend(rec.devices.iter().cloned().map(Some));
+                        rec.device = cycle(&opts, &rec.device, delta);
+                        self.connect_recording();
+                    }
+                    REC_VOL => {
+                        rec.vol = (rec.vol as i32 + delta).clamp(0, 0xFF) as u8;
+                        rec.capture.set_gain(rec.gain());
+                    }
+                    REC_ARM if !busy => rec.arm = (rec.arm as i32 + delta).clamp(0, 0xFF) as u8,
+                    REC_PLAY if !busy => {
+                        rec.play = match rec.play {
+                            None => Some(0),
+                            Some(v) => Some((v as i32 + delta).clamp(0, 0xFF) as u8),
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Button::Play => {
+                if busy {
+                    return self.stop_recording();
+                }
+                let sample = rec.sample.clone();
+                if let Some(r) = &self.rack {
+                    r.shared.audition(sample);
+                }
+            }
+            _ => {}
+        }
+    }
+
     // --- modal screens ------------------------------------------------------------
 
     fn modal_press(&mut self, p: Press) {
@@ -2056,6 +2397,18 @@ impl App {
                 match *target {
                     TextTarget::SongName => self.song.name = v,
                     TextTarget::InstrumentName(n) => self.song.instruments[n as usize].name = v,
+                    TextTarget::RecordingFile => {
+                        let v: String = v
+                            .trim()
+                            .chars()
+                            .map(|c| if "/\\:*?\"<>|".contains(c) { '_' } else { c })
+                            .collect();
+                        if let Some(rec) = self.recording.as_mut().filter(|_| !v.is_empty()) {
+                            rec.name = v;
+                        }
+                        self.modal = None;
+                        return;
+                    }
                 }
                 self.modal = None;
                 self.changed();
@@ -2076,6 +2429,11 @@ impl App {
     fn draw(&mut self, s: &mut Screen) {
         if self.view == View::Instrument {
             self.refresh_params();
+        }
+        if self.recording.is_some() {
+            self.draw_recording(s);
+            self.draw_status(s);
+            return;
         }
         match &self.modal {
             Some(Modal::Plugins { list, cur, .. }) => {
@@ -2401,13 +2759,25 @@ impl App {
         for (i, (label, value)) in fields.iter().enumerate() {
             let y = 2 + i;
             s.text(0, y, label, Role::Default);
-            let v: String = value.chars().take(PANEL_X - 10).collect();
+            // A sampler's SAMPLE row ends in REC., as on the M8.
+            let rec = sampler && i == 2;
+            let room = if rec { PANEL_X - 16 } else { PANEL_X - 10 };
+            let v: String = value.chars().take(room).collect();
             s.text(9, y, &v, Role::Value);
+            if rec {
+                s.text(PANEL_X - 6, y, "REC.", Role::Value);
+            }
             if c.row == i {
-                s.highlight(9, y, v.chars().count().max(2), Role::Cursor);
+                if rec && self.sample_col == 1 {
+                    s.highlight(PANEL_X - 6, y, 4, Role::Cursor);
+                } else {
+                    s.highlight(9, y, v.chars().count().max(2), Role::Cursor);
+                }
             }
         }
-        if c.row == 2 {
+        if c.row == 2 && sampler && self.sample_col == 1 {
+            s.text(0, 7, "EDIT: RECORD A SAMPLE", Role::Info);
+        } else if c.row == 2 {
             s.text(0, 7, "EDIT: LIST, EDIT+L/R: NEXT", Role::Info);
         }
         if sampler {
@@ -2458,6 +2828,133 @@ impl App {
                 s.highlight(17, y, text.chars().count().max(2), Role::Cursor);
             }
         }
+    }
+
+    /// The sample recording screen.
+    fn draw_recording(&self, s: &mut Screen) {
+        let Some(rec) = self.recording.as_deref() else {
+            return;
+        };
+        let busy = rec.capture.is_recording();
+        s.text(0, 0, "SAMPLE RECORD", Role::Title);
+        s.text(31, 0, &format!("INST. {:02X}", rec.instrument), Role::Info);
+        let start = match (busy, rec.capture.triggered()) {
+            (true, false) => "ARMED",
+            (true, true) => "STOP",
+            _ => "START",
+        };
+        let device = if !rec.source.is_input() {
+            "--".to_string()
+        } else if let Some(i) = &rec.input {
+            i.name.clone()
+        } else {
+            rec.device.clone().unwrap_or_else(|| "DEFAULT".into())
+        };
+        let values = [
+            start.to_string(),
+            rec.source.name().to_string(),
+            device,
+            format!("{:02X}", rec.vol),
+            if rec.arm == 0 {
+                "OFF".into()
+            } else {
+                format!("{:02X}", rec.arm)
+            },
+            rec.play.map_or("--".into(), |r| format!("{r:02X}")),
+            rec.name.clone(),
+            "SAVE".to_string(),
+        ];
+        for (i, (label, value)) in REC_ROWS.iter().zip(&values).enumerate() {
+            let y = 2 + i + (i >= REC_NAME) as usize;
+            s.text(0, y, label, Role::Default);
+            let v: String = value.to_uppercase().chars().take(30).collect();
+            let role = match i {
+                REC_START if busy => Role::MeterPeak,
+                REC_SAVE if rec.take.is_none() => Role::Info,
+                _ => Role::Value,
+            };
+            s.text(9, y, &v, role);
+            if rec.row == i {
+                s.highlight(9, y, v.chars().count().max(2), Role::Cursor);
+            }
+        }
+
+        // Level meter, with the ARM level marked.
+        let width = 30;
+        let y = 13;
+        s.text(0, y, "LEVEL", Role::Default);
+        let db = 20.0 * rec.meter.max(1e-6).log10();
+        let col = |level: f32| -> usize {
+            let db = 20.0 * level.max(1e-6).log10();
+            (((db + 48.0) / 48.0).clamp(0.0, 1.0) * width as f32).round() as usize
+        };
+        let filled = col(rec.meter);
+        for i in 0..width {
+            let role = if i >= filled {
+                Role::Empty
+            } else if i >= width - 3 {
+                Role::MeterPeak
+            } else if i >= width * 3 / 4 {
+                Role::MeterMid
+            } else {
+                Role::MeterLow
+            };
+            s.text(9 + i, y, "\u{2588}", role);
+        }
+        if rec.arm > 0 {
+            let x = col(rec.arm as f32 / 255.0).min(width - 1);
+            s.text(9 + x, y + 1, "^", Role::Info);
+        }
+        if rec.meter > 1e-6 {
+            s.text(9, y + 1, &format!("{db:.0} DB"), Role::Info);
+        }
+
+        // The take so far.
+        if let Some(t) = &rec.take {
+            const BARS: [char; 8] = [
+                '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}',
+                '\u{2588}',
+            ];
+            let width = 39;
+            let peaks = t.peaks(width);
+            for (x, pk) in peaks.iter().enumerate() {
+                let level = (pk.min(1.0) * 7.0).round() as usize;
+                let ch = if *pk < 1e-4 { ' ' } else { BARS[level.min(7)] };
+                s.text(x, 16, &ch.to_string(), Role::Value);
+            }
+            let secs = t.seconds();
+            s.text(
+                0,
+                17,
+                &format!(
+                    "{:02}:{:05.2}  {}HZ {}",
+                    (secs / 60.0) as u32,
+                    secs % 60.0,
+                    t.sample_rate,
+                    if t.mono { "MONO" } else { "STEREO" }
+                ),
+                Role::Info,
+            );
+        }
+
+        if let Some(p) = &rec.problem {
+            let p: String = format!("! {p}").to_uppercase().chars().take(40).collect();
+            s.text(0, 19, &p, Role::MeterPeak);
+        }
+        let hint = if busy {
+            "EDIT OR OPTION STOPS"
+        } else if rec.take.is_some() {
+            "PLAY LISTENS, OPTION GOES BACK"
+        } else {
+            "EDIT ON START RECORDS, OPTION GOES BACK"
+        };
+        s.text(0, 21, hint, Role::Info);
+        let dir = sample_path_for(
+            &self.sample_dirs().0,
+            &recorder::recordings_dir(&self.sample_dirs().0),
+        );
+        let to: String = format!("TO {dir}/").chars().take(40).collect();
+        s.text(0, 22, &to, Role::Info);
     }
 
     /// The sampler's waveform and settings, below the common rows.
@@ -2814,6 +3311,8 @@ mod tests {
             table: 0,
             groove: 0,
             project_col: 0,
+            sample_col: 0,
+            recording: None,
             render_seconds: 60,
             devices: Vec::new(),
             last: HashMap::new(),
@@ -2992,6 +3491,76 @@ mod tests {
         assert!(s.row(9).starts_with('S'), "{}", s.row(9));
         assert!(s.row(11).starts_with("VOLUME     00"), "{}", s.row(11));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn record_a_sample() {
+        let dir = std::env::temp_dir().join(format!("lextrack-record-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("Songs")).unwrap();
+        let mut a = app();
+        a.path = Some(dir.join("Songs").join("X.m8s"));
+        a.song.directory = "/Songs/".into();
+        a.view = View::Instrument;
+        a.song.instruments[0].set_kind(InstrumentKind::Sampler);
+
+        // RIGHT on SAMPLE moves to REC., and EDIT there opens the recorder.
+        a.set_cur(Cursor { row: 2, col: 0 });
+        tap(&mut a, Button::Right);
+        let mut s = Screen::new();
+        a.draw(&mut s);
+        assert!(s.row(4).contains("REC."), "{}", s.row(4));
+        tap(&mut a, Button::Edit);
+        assert!(a.recording.is_some());
+        assert_eq!(a.recording.as_ref().unwrap().name, "REC000");
+
+        // SRC: EDIT+LEFT from L&R wraps round to MASTER.
+        tap(&mut a, Button::Down);
+        with(&mut a, Button::Left, |h| h.edit = true);
+        assert_eq!(a.recording.as_ref().unwrap().source, Source::Master);
+
+        // Feed the capture as the rack would, then stop with EDIT on START.
+        {
+            let rec = a.recording.as_mut().unwrap();
+            rec.take = Some(Take::new(48_000, false));
+            rec.capture.start(0.0, 64);
+            rec.capture.push(64, |i| ((i as f32 / 64.0), -0.5));
+        }
+        a.tick_recording();
+        a.recording.as_mut().unwrap().row = REC_START;
+        tap(&mut a, Button::Edit);
+        let rec = a.recording.as_ref().unwrap();
+        assert!(!rec.capture.is_recording());
+        assert_eq!(rec.take.as_ref().unwrap().frames(), 64);
+        assert!(rec.sample.is_some());
+        let mut s = Screen::new();
+        a.draw(&mut s);
+        assert!(s.row(0).starts_with("SAMPLE RECORD"), "{}", s.row(0));
+        assert!(s.row(17).contains("48000HZ STEREO"), "{}", s.row(17));
+
+        // SAVE writes the file and loads it into the instrument.
+        a.recording.as_mut().unwrap().row = REC_SAVE;
+        tap(&mut a, Button::Edit);
+        assert!(a.recording.is_none());
+        let file = dir.join("Samples/Recordings/REC000.wav");
+        assert!(file.is_file());
+        let inst = &a.song.instruments[0];
+        assert_eq!(inst.sample_path, "/Samples/Recordings/REC000.wav");
+        assert_eq!(inst.name, "REC000");
+        a.sync_samplers();
+        assert_eq!(a.samplers.samples[0].as_ref().unwrap().frames(), 64);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unsaved_take_asks_before_closing() {
+        let mut a = app();
+        a.view = View::Instrument;
+        a.open_recorder(0);
+        a.recording.as_mut().unwrap().take = Some(Take::new(48_000, true));
+        tap(&mut a, Button::Option);
+        assert!(a.recording.is_some());
+        tap(&mut a, Button::Option);
+        assert!(a.recording.is_none());
     }
 
     #[test]
