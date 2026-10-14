@@ -41,12 +41,17 @@ OPTIONS:
     --render <OUT.wav>    Render to a WAV file instead of opening the tracker
     --seconds <S>         Length to render (default 30)
     --no-audio            Don't open a sound card
+    --terminal            Use the terminal UI instead of a window
     --device <NAME>       Audio output device (see --list-devices), or \"default\"
     --sample-rate <HZ>    Sample rate, e.g. 48000, or \"default\"
     --buffer <FRAMES>     Buffer size, e.g. 256, or \"default\"
     --list                List installed CLAP plugins and exit
     --list-devices        List audio output devices and exit
     -h, --help            Show this help
+
+The tracker opens in its own window, with the M8's eight buttons drawn
+under the screen and lit while held. Without a display (e.g. over SSH) or
+with --terminal it runs in the terminal instead.
 
 BUTTONS (the M8 has eight):
     Arrows                UP DOWN LEFT RIGHT
@@ -57,8 +62,8 @@ BUTTONS (the M8 has eight):
     Delete                EDIT+OPTION
     Ctrl+Q                Quit
 
-In terminals that report key releases (kitty, foot, WezTerm, Ghostty...),
-A, Z, X and S can be held like the M8's buttons: hold X and press Right
+In the window, and in terminals that report key releases (kitty, foot,
+WezTerm, Ghostty...), A, Z, X and S can be held like the M8's buttons: hold X and press Right
 for EDIT+RIGHT. Elsewhere, use the modifier keys, and a capital letter adds
 SHIFT (Shift+Z is SHIFT+OPTION).
 
@@ -92,6 +97,7 @@ struct Opts {
     render: Option<PathBuf>,
     seconds: f64,
     no_audio: bool,
+    terminal: bool,
     device: Option<Option<String>>,
     sample_rate: Option<Option<u32>>,
     buffer: Option<Option<u32>>,
@@ -111,6 +117,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Opts> {
         render: None,
         seconds: 30.0,
         no_audio: false,
+        terminal: false,
         device: None,
         sample_rate: None,
         buffer: None,
@@ -146,6 +153,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Opts> {
             Some("--render") => o.render = Some(value(&mut it, "--render")?.into()),
             Some("--seconds") => o.seconds = value(&mut it, "--seconds")?.parse()?,
             Some("--no-audio") => o.no_audio = true,
+            Some("--terminal") => o.terminal = true,
             Some("--device") => {
                 let v = value(&mut it, "--device")?;
                 o.device = Some((v != "default").then_some(v));
@@ -273,9 +281,6 @@ pub fn run(args: impl Iterator<Item = OsString>) -> Result<()> {
         return Ok(());
     }
 
-    if !std::io::stdout().is_terminal() {
-        bail!("lextrack needs a terminal (use --info or --render for plain output)");
-    }
     let mut audio = AudioSettings::load();
     if let Some(d) = o.device.clone() {
         audio.device = d;
@@ -286,21 +291,38 @@ pub fn run(args: impl Iterator<Item = OsString>) -> Result<()> {
     if let Some(b) = o.buffer {
         audio.buffer_size = b;
     }
+    let options = Options {
+        path: o.song,
+        map,
+        use_device: !o.no_audio,
+        audio,
+        note_offset: o.note_offset,
+        row: o.row,
+    };
+    let tty = std::io::stdout().is_terminal();
+
+    #[cfg(feature = "window")]
+    if !o.terminal {
+        match super::window::event_loop() {
+            Ok(event_loop) => {
+                let mut app = App::new(song, options);
+                let r = super::window::run(event_loop, &mut app);
+                app.shutdown();
+                return r;
+            }
+            Err(e) if tty => eprintln!("lextrack: no window ({e:#}), using the terminal"),
+            Err(e) => return Err(e.context("can't open a window")),
+        }
+    }
+
+    if !tty {
+        bail!("lextrack needs a terminal (use --info or --render for plain output)");
+    }
     // Enter the terminal first: it also routes console output from plugins
     // and the audio system to a log file, away from the screen.
     let tty = crate::TtyGuard::enter()?;
     let mut term = Terminal::new(CrosstermBackend::new(tty.writer()?))?;
-    let mut app = App::new(
-        song,
-        Options {
-            path: o.song,
-            map,
-            use_device: !o.no_audio,
-            audio,
-            note_offset: o.note_offset,
-            row: o.row,
-        },
-    );
+    let mut app = App::new(song, options);
     let r = app.run(&mut term);
     app.shutdown();
     drop(term);

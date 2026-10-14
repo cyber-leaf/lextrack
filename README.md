@@ -1,21 +1,8 @@
 # lextrack
 
-A terminal tracker modelled on the [Dirtywave M8](https://dirtywave.com), with an M8-style sampler built in and [CLAP](https://cleveraudio.org) plugins in place of the M8's other synths. It opens M8 song files (`.m8s`), shows them on an M8-style screen, and lets you play and edit them with the M8's eight buttons.
+A tracker modelled on the [Dirtywave M8](https://dirtywave.com), with an M8-style sampler built in and [CLAP](https://cleveraudio.org) plugins in place of the M8's other synths. It opens M8 song files (`.m8s`), shows them on an M8-style screen in its own window (or in a terminal), and lets you play and edit them with the M8's eight buttons.
 
-```
-SONG                             ███████
-                                   118.0
-   1  2  3  4  5  6  7  8
-00 00 02 04 -- -- -- -- --       1 C-3
-01 01 03 05 -- -- -- -- --       2 G-4
-02 -- -- -- -- -- -- -- --       3 ---
-03 -- -- -- -- -- -- -- --       4 ---
-...
-                                  P GM
-                                 LSCPIT
-                                  V
-                                  E
-```
+![The lextrack window: the song view, with EDIT and RIGHT held](docs/window.png)
 
 ## Build
 
@@ -28,6 +15,8 @@ sudo pacman -S base-devel alsa-lib                           # Arch
 
 cargo build --release
 ```
+
+The window works on X11 and Wayland (it needs `libxkbcommon-x11`, which every desktop has), macOS and Windows. To build without it, terminal UI only: `cargo build --release --no-default-features`.
 
 The binary is at `target/release/lextrack`. On PipeWire or PulseAudio systems, audio goes through their ALSA compatibility layer, which is the default on current distros.
 
@@ -45,7 +34,10 @@ lextrack examples/demo.m8s --plugin ~/.clap/Surge\ XT.clap   # a short demo song
 lextrack --list                           # list installed plugins
 lextrack --list-devices                   # list audio outputs and the saved settings
 lextrack MYSONG.m8s --no-audio            # don't open the sound card
+lextrack MYSONG.m8s --terminal            # the terminal UI instead of a window
 ```
+
+The tracker opens in a window showing the M8's 320x240 screen, scaled up to fit, with the eight buttons drawn underneath and lit while they're held. When there is no display (over SSH, say) it runs in the terminal instead.
 
 `lextrack m8 ...` still works as an alias.
 
@@ -55,7 +47,7 @@ Plugins are found in `~/.clap`, `/usr/lib/clap` and `/usr/local/lib/clap` on Lin
 
 ## Buttons
 
-The M8 has eight buttons: UP, DOWN, LEFT, RIGHT, SHIFT, PLAY, OPTION and EDIT. Almost everything is one button pressed while others are held. A terminal can't report a modifier key on its own, so each button has two spellings:
+The M8 has eight buttons: UP, DOWN, LEFT, RIGHT, SHIFT, PLAY, OPTION and EDIT. Almost everything is one button pressed while others are held. Each button has two spellings, because a terminal can't report a modifier key on its own:
 
 | M8 button | Key | Held with an arrow |
 | --- | --- | --- |
@@ -67,7 +59,7 @@ The M8 has eight buttons: UP, DOWN, LEFT, RIGHT, SHIFT, PLAY, OPTION and EDIT. A
 | EDIT+OPTION | Delete or Backspace | |
 | Quit | Ctrl+Q | |
 
-In terminals that report key releases (kitty, foot, WezTerm, Ghostty, Alacritty, and the Windows console), A, Z, X and S can be held like the M8's buttons: hold X and press Right for EDIT+RIGHT, or hold Z and press X for OPTION+EDIT. Elsewhere the modifier keys do the holding, with letters as well as arrows: Shift+Z is SHIFT+OPTION, Shift+X is SHIFT+EDIT, Shift+S is SHIFT+PLAY, Ctrl+S is EDIT+PLAY, Alt+S is OPTION+PLAY, Alt+A is OPTION+SHIFT and Alt+Shift+S is OPTION+SHIFT+PLAY.
+In the window, A, Z, X and S can be held like the M8's buttons: hold X and press Right for EDIT+RIGHT, or hold Z and press X for OPTION+EDIT. They go by key position, so they're in the same place on any keyboard layout. The same works in terminals that report key releases (kitty, foot, WezTerm, Ghostty, Alacritty, and the Windows console). In other terminals the modifier keys do the holding, with letters as well as arrows: Shift+Z is SHIFT+OPTION, Shift+X is SHIFT+EDIT, Shift+S is SHIFT+PLAY, Ctrl+S is EDIT+PLAY, Alt+S is OPTION+PLAY, Alt+A is OPTION+SHIFT and Alt+Shift+S is OPTION+SHIFT+PLAY.
 
 | Combination | Action |
 | --- | --- |
@@ -167,9 +159,9 @@ The song reader and writer are a Rust port of [m8-js](https://github.com/whitloc
 - `src/m8/instruments.rs` reads and writes instrument maps and plugin states.
 - `src/m8/sampler.rs` is the built-in sampler: WAV loading, finding sample files, and the voices.
 - `src/m8/recorder.rs` records samples from an audio input (via cpal) or the master output, and saves them as WAV files.
-- `src/m8/screen.rs` is the 40x24 character screen in the M8's default colours; `src/m8/input.rs` turns keys into M8 button presses; `src/m8/ui.rs` holds the views; `src/m8/app.rs` is the command line.
+- `src/m8/screen.rs` is the 40x24 character screen in the M8's default colours; `src/m8/input.rs` turns keys into M8 button presses; `src/m8/ui.rs` holds the views; `src/m8/window.rs` draws the screen and buttons in a window (winit and softbuffer, with the public-domain font8x8 pixel font); `src/m8/app.rs` is the command line.
 - `src/plugin.rs` loads `.clap` files and implements the host side of the CLAP API (`clap.params`, `clap.state`, `clap.log`, `clap.thread-check`, `clap.audio-ports`).
 - `src/audio.rs`, `src/settings.rs` and `src/discovery.rs` find sound cards, save audio settings and find plugins.
 - `test-plugin/` is a tiny test-tone CLAP plugin used for testing. Build it with `cargo build -p lextrack-test-plugin`, then copy `target/debug/liblextrack_test_plugin.so` to `~/.clap/TestTone.clap`.
 
-On Linux and macOS, anything a plugin prints to the console goes to `lextrack-plugin-output.log` in the temp folder, so it doesn't break the display.
+In the terminal UI on Linux and macOS, anything a plugin prints to the console goes to `lextrack-plugin-output.log` in the temp folder, so it doesn't break the display.
