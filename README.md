@@ -69,6 +69,8 @@ The M8 has eight buttons: UP, DOWN, LEFT, RIGHT, SHIFT, PLAY, OPTION and EDIT. A
 
 In terminals that report key releases (kitty, foot, WezTerm, Ghostty, Alacritty, and the Windows console), A, Z, X and S can be held like the M8's buttons: hold X and press Right for EDIT+RIGHT, or hold Z and press X for OPTION+EDIT. Elsewhere the modifier keys do the holding, with letters as well as arrows: Shift+Z is SHIFT+OPTION, Shift+X is SHIFT+EDIT, Shift+S is SHIFT+PLAY, Ctrl+S is EDIT+PLAY, Alt+S is OPTION+PLAY, Alt+A is OPTION+SHIFT and Alt+Shift+S is OPTION+SHIFT+PLAY.
 
+A strip under the screen (or beside it, in a 24-row terminal) shows the eight buttons and lights the ones you're pressing, modifiers included, with the name of the last key the terminal sent. It helps to check what a key combination means before blaming the app or the terminal. Where the terminal reports key releases, a button stays lit until you let go of its key; elsewhere it stays lit for a moment after each press, and for as long as a held key repeats.
+
 | Combination | Action |
 | --- | --- |
 | SHIFT + arrows | Move between views (see the map below) |

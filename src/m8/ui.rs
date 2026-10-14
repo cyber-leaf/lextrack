@@ -22,7 +22,7 @@ use super::format::{
     S_DRY, S_ENV, S_FILTER, S_LENGTH, S_LFO, S_LIMIT, S_LOOP, S_PAN, S_PLAY, S_RES, S_REVERB,
     S_SLICE, S_START, TABLES, TRACKS,
 };
-use super::input::{Button, Input, Keys, Press, RELEASE_EVENTS};
+use super::input::{Button, Input, Keys, Lights, Press, RELEASE_EVENTS};
 use super::instruments::{InstrumentMap, PluginRef};
 use super::rack::{load_slots_reusing, render_wav, wanted_instruments, Rack, Slot};
 use super::recorder::{self, Capture, Source, Take, SOURCES};
@@ -431,6 +431,7 @@ pub struct App {
     dirty: bool,
     unsaved: bool,
     keys: Keys,
+    lights: Lights,
     quit: bool,
 }
 
@@ -484,6 +485,7 @@ impl App {
             dirty: false,
             unsaved: false,
             keys: Keys::default(),
+            lights: Lights::default(),
             quit: false,
         };
         app.cursors.insert(
@@ -504,6 +506,7 @@ impl App {
                 let mut s = Screen::new();
                 self.draw(&mut s);
                 s.render(f.area(), f.buffer_mut());
+                self.lights.render(f.area(), f.buffer_mut(), Instant::now());
             })?;
             if event::poll(Duration::from_millis(25))? {
                 loop {
@@ -673,6 +676,7 @@ impl App {
             return;
         }
         let releases = RELEASE_EVENTS.load(Ordering::Relaxed);
+        self.lights.key(k, releases, Instant::now());
         match self.keys.translate(k, releases) {
             Input::Quit => self.quit = true,
             Input::Press(p) => {
@@ -3333,6 +3337,7 @@ mod tests {
             dirty: false,
             unsaved: false,
             keys: Keys::default(),
+            lights: Lights::default(),
             quit: false,
         };
         a.dirty = false;
