@@ -1339,17 +1339,7 @@ impl App {
         if kind == Kind::Note && val >= 0x80 {
             return;
         }
-        let d = delta_for(kind.big_step());
-        let v = if kind == Kind::FxCmd {
-            // Sequencer effects, then the instrument (sampler) effects.
-            let all: Vec<u8> = fx_commands().collect();
-            let i = all.iter().position(|&c| c == val).unwrap_or(0) as i32;
-            all[(i + d).clamp(0, all.len() as i32 - 1) as usize]
-        } else if kind == Kind::Transpose {
-            (val as i32 + d).rem_euclid(256) as u8
-        } else {
-            (val as i32 + d).clamp(0, kind.max() as i32) as u8
-        };
+        let v = step_value(kind, val, delta_for(kind.big_step()));
         if v != val {
             self.set_cell(self.view, c.row, c.col, v);
         }
@@ -1570,8 +1560,108 @@ impl App {
                 self.selection = None;
                 self.clone_under_cursor();
             }
+            b if b.is_direction() && h.edit && !h.option && !h.shift => self.selection_edit(b),
             b if b.is_direction() && h.none() => self.move_cursor(b),
             _ => {}
+        }
+    }
+
+    /// EDIT + direction over a selection. As on the M8, each value moves by
+    /// the step on its own (empty cells and note offs stay as they are).
+    /// In the song, EDIT+UP/DOWN moves the selected rows instead, and
+    /// EDIT+LEFT/RIGHT works on one column at a time, filling empty slots
+    /// with the column's first chain plus the step.
+    fn selection_edit(&mut self, b: Button) {
+        let Some((r0, c0, r1, c1)) = self.selected() else {
+            return;
+        };
+        if self.view == View::Song {
+            return match b {
+                Button::Up | Button::Down => self.move_song_rows(b == Button::Up),
+                _ if c0 == c1 => self.song_column_step(r0, r1, c0, b == Button::Right),
+                _ => {}
+            };
+        }
+        for c in c0..=c1 {
+            let Some(kind) = self.kind_at(c) else {
+                continue;
+            };
+            let d = match b {
+                Button::Left => -1,
+                Button::Right => 1,
+                Button::Down => -kind.big_step(),
+                _ => kind.big_step(),
+            };
+            for r in r0..=r1 {
+                let val = self.cell(self.view, r, c);
+                if (val == EMPTY && kind.can_be_empty()) || (kind == Kind::Note && val >= 0x80) {
+                    continue;
+                }
+                self.set_cell(self.view, r, c, step_value(kind, val, d));
+            }
+        }
+    }
+
+    fn song_column_step(&mut self, r0: usize, r1: usize, col: usize, up: bool) {
+        let d = if up { 1 } else { -1 };
+        let rows = &self.song.rows;
+        let Some(first) = (r0..=r1).map(|r| rows[r][col]).find(|&v| v != EMPTY) else {
+            return;
+        };
+        for r in r0..=r1 {
+            let v = match self.song.rows[r][col] {
+                EMPTY => first,
+                v => v,
+            };
+            self.set_cell(View::Song, r, col, step_value(Kind::Chain, v, d));
+        }
+    }
+
+    /// Slide the selected song rows one row up or down, into an empty row
+    /// next to them. The selection and cursor move along.
+    fn move_song_rows(&mut self, up: bool) {
+        let Some((r0, c0, r1, c1)) = self.selected() else {
+            return;
+        };
+        let target = if up {
+            match r0.checked_sub(1) {
+                Some(r) => r,
+                None => return,
+            }
+        } else {
+            if r1 + 1 >= SONG_ROWS {
+                return;
+            }
+            r1 + 1
+        };
+        if (c0..=c1).any(|c| self.song.rows[target][c] != EMPTY) {
+            return self.flash("NO ROOM TO MOVE");
+        }
+        for c in c0..=c1 {
+            if up {
+                for r in r0..=r1 {
+                    let v = self.song.rows[r][c];
+                    self.set_cell(View::Song, r - 1, c, v);
+                }
+                self.set_cell(View::Song, r1, c, EMPTY);
+            } else {
+                for r in (r0..=r1).rev() {
+                    let v = self.song.rows[r][c];
+                    self.set_cell(View::Song, r + 1, c, v);
+                }
+                self.set_cell(View::Song, r0, c, EMPTY);
+            }
+        }
+        let shift = |row: usize| if up { row - 1 } else { row + 1 };
+        let mut cur = self.cur();
+        if let Some(s) = self.selection.as_mut() {
+            if (r0..=r1).contains(&s.anchor.row) {
+                s.anchor.row = shift(s.anchor.row);
+            }
+        }
+        if (r0..=r1).contains(&cur.row) {
+            cur.row = shift(cur.row);
+            self.set_cur(cur);
         }
     }
 
@@ -3336,6 +3426,21 @@ impl App {
     }
 }
 
+/// `val` moved by `d`: effects step through the list, transposes wrap
+/// round and the rest stop at their limits.
+fn step_value(kind: Kind, val: u8, d: i32) -> u8 {
+    if kind == Kind::FxCmd {
+        // Sequencer effects, then the instrument (sampler) effects.
+        let all: Vec<u8> = fx_commands().collect();
+        let i = all.iter().position(|&c| c == val).unwrap_or(0) as i32;
+        all[(i + d).clamp(0, all.len() as i32 - 1) as usize]
+    } else if kind == Kind::Transpose {
+        (val as i32 + d).rem_euclid(256) as u8
+    } else {
+        (val as i32 + d).clamp(0, kind.max() as i32) as u8
+    }
+}
+
 fn cycle<T: Clone + PartialEq>(opts: &[T], cur: &T, delta: i32) -> T {
     let i = opts.iter().position(|o| o == cur).unwrap_or(0) as i32;
     opts[(i + delta.signum()).rem_euclid(opts.len() as i32) as usize].clone()
@@ -3841,6 +3946,54 @@ mod tests {
         });
         with(&mut a, Button::Right, option);
         assert_eq!((a.chain, a.chain_ctx.unwrap().track), (9, 6));
+    }
+
+    #[test]
+    fn edit_moves_every_selected_value() {
+        let mut a = app();
+        let edit = |h: &mut super::super::input::Held| h.edit = true;
+        a.view = View::Phrase;
+        let st = &mut a.song.phrases[0].steps;
+        st[0].note = 40;
+        st[1].note = 0x80; // note off
+        st[2].note = 0x7A;
+        st[0].volume = 0x10;
+        // Select the notes and volumes on rows 0 to 3.
+        a.set_cur(Cursor { row: 0, col: 0 });
+        with(&mut a, Button::Option, |h| h.shift = true);
+        a.set_cur(Cursor { row: 3, col: 1 });
+        with(&mut a, Button::Up, edit);
+        let st = &a.song.phrases[0].steps;
+        assert_eq!(
+            [st[0].note, st[1].note, st[2].note, st[3].note],
+            [52, 0x80, 0x7F, EMPTY]
+        );
+        assert_eq!([st[0].volume, st[1].volume], [0x20, EMPTY]);
+        with(&mut a, Button::Left, edit);
+        let st = &a.song.phrases[0].steps;
+        assert_eq!((st[0].note, st[0].volume), (51, 0x1F));
+    }
+
+    #[test]
+    fn song_selection_moves_rows_and_steps_chains() {
+        let mut a = app();
+        let edit = |h: &mut super::super::input::Held| h.edit = true;
+        a.song.rows[2][0] = 4;
+        a.song.rows[3][0] = 6;
+        a.set_cur(Cursor { row: 2, col: 0 });
+        with(&mut a, Button::Option, |h| h.shift = true);
+        a.set_cur(Cursor { row: 4, col: 0 });
+        // EDIT+RIGHT: empty slots take the first chain plus one.
+        with(&mut a, Button::Right, edit);
+        assert_eq!(
+            &[a.song.rows[2][0], a.song.rows[3][0], a.song.rows[4][0]],
+            &[5, 7, 5]
+        );
+        // EDIT+UP moves the rows up into the empty row above.
+        with(&mut a, Button::Up, edit);
+        let col: Vec<u8> = (0..6).map(|r| a.song.rows[r][0]).collect();
+        assert_eq!(col, [EMPTY, 5, 7, 5, EMPTY, EMPTY]);
+        assert_eq!(a.selected().unwrap(), (1, 0, 3, 0));
     }
 
     #[test]

@@ -59,6 +59,24 @@ scale 2, instrument 3, table 4.
 - PLAY and SHIFT+PLAY go to the view's play action. In song and chain,
   LEFT+PLAY works like PLAY.
 
+## Editing a selection
+
+With a selection held, EDIT+arrows change every selected cell at once:
+
+- Each value moves by the step on its own (relative, not set to one value):
+  ±1 for LEFT/RIGHT, and ±16 (±12 on notes and transposes) for UP/DOWN.
+  Values stop at their limits.
+- Empty cells stay empty, and note offs are skipped.
+- In the song, EDIT+UP/DOWN moves the selected rows up or down by one row.
+  EDIT+LEFT/RIGHT works when one column is selected, and empty slots in it
+  get the column's first chain plus the step.
+- The firmware hands phrase and table selections that span several columns
+  to a function that isn't in the dump. lextrack applies the same per-cell
+  rule to each column, which is an inference.
+- When the row next to a moving song block isn't empty, the firmware runs
+  extra logic that can't be followed with confidence. lextrack doesn't move
+  the block then and shows "NO ROOM TO MOVE".
+
 ## Song
 
 - SHIFT+RIGHT opens the chain under the cursor. On an empty slot it opens the
@@ -123,13 +141,14 @@ scale 2, instrument 3, table 4.
 | SHIFT+UP from phrase | the last groove viewed | the groove of the GRV on or above the row |
 | OPTION+LEFT/RIGHT in chain and phrase | stopped at an empty track | skips to the next track with something on it |
 | Table number changes | instrument stayed | the instrument follows for 00-7F |
+| EDIT+arrows on a selection | did nothing | moves every selected value by the step. In the song, UP/DOWN moves the selected rows |
 
 ## Still different (needs views lextrack doesn't have, or data the dump lacks)
 
 - Views 0D and 16, plus mixer, scale, EQ, instrument list and live mode, aren't
   in lextrack. The mini-map letters stay as before because the dump has no
   label text to check them against.
-- Moving song rows with a selection held, the transpose message, the random
-  instrument combo, and editing with PLAY held aren't done yet.
+- The transpose message, the random instrument combo, and editing with PLAY
+  held aren't done yet.
 - Screen layouts, the font and labels can't be checked because they're in
   data the dump doesn't include.

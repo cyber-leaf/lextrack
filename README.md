@@ -70,7 +70,7 @@ In the window, A, Z, X and S can be held like the M8's buttons: hold X and press
 | EDIT + OPTION | Delete. On an empty note, insert a note off |
 | OPTION + UP / DOWN | Song: jump 16 rows. Chain: the chain on the previous or next song row. Phrase: the previous or next phrase in the chain |
 | OPTION + LEFT / RIGHT | Chain and phrase: the previous or next track that has something on this row. Instrument, table, groove: the previous or next number (instrument and table: UP adds 16, DOWN takes 16 off) |
-| SHIFT + OPTION | Start a selection. Move to extend it, press SHIFT+OPTION again to widen it to whole columns, rows, then everything. OPTION copies, EDIT+OPTION cuts, SHIFT+EDIT clones the chain, phrase or instrument under the cursor |
+| SHIFT + OPTION | Start a selection. Move to extend it, press SHIFT+OPTION again to widen it to whole columns, rows, then everything. OPTION copies, EDIT+OPTION cuts, SHIFT+EDIT clones the chain, phrase or instrument under the cursor. EDIT+arrows move every selected value by the step, skipping empty cells. In the song, EDIT+UP/DOWN moves the selected rows |
 | SHIFT + EDIT | Paste |
 | PLAY | Song: play from the cursor row. Chain: loop the chain. Phrase: loop the phrase. Press again to stop |
 | SHIFT + PLAY | From a chain or phrase, play the song from that row |
