@@ -17,6 +17,7 @@ use cpal::{FromSample, Sample, SizedSample};
 
 use super::format::{Song, INSTRUMENTS, TRACKS};
 use super::instruments::{InstrumentMap, PluginRef};
+use super::sampler::{self, SamplerEngine, SamplerSet};
 use super::sequencer::{samples_per_tick, Pos, SeqEvent, Sequencer};
 use crate::audio::{find_device, pick_config, MAX_BLOCK};
 use crate::plugin::{
@@ -33,12 +34,13 @@ pub struct Slot {
 }
 
 /// The instruments that need a plugin: those the song plays, plus those
-/// given a plugin of their own.
+/// given a plugin of their own, less those the built-in sampler plays.
 pub fn wanted_instruments(song: &Song, map: &InstrumentMap) -> Vec<u8> {
     let mut v = song.used_instruments();
     v.extend(map.numbered());
     v.sort_unstable();
     v.dedup();
+    v.retain(|&n| !map.builtin_sampler(n, &song.instruments[n as usize]));
     v
 }
 
@@ -114,6 +116,8 @@ enum Command {
     /// M8 note, on).
     Preview(u8, i16, bool),
     Param(u8, ParamChange),
+    Samplers(Arc<SamplerSet>),
+    Audition(Option<Arc<sampler::Sample>>),
 }
 
 /// State shared between the UI and the audio thread.
@@ -219,6 +223,16 @@ impl RackShared {
 
     pub fn set_param(&self, instrument: u8, change: ParamChange) {
         self.send(Command::Param(instrument, change));
+    }
+
+    /// Hand the audio thread new samples for the built-in sampler.
+    pub fn set_samplers(&self, set: Arc<SamplerSet>) {
+        self.send(Command::Samplers(set));
+    }
+
+    /// Play a sample file as it is, or stop the one playing.
+    pub fn audition(&self, sample: Option<Arc<sampler::Sample>>) {
+        self.send(Command::Audition(sample));
     }
 
     pub fn take_peak(&self) -> f32 {
@@ -353,6 +367,7 @@ impl SlotProc {
 /// thread.
 pub struct Processor {
     seq: Sequencer,
+    sampler: SamplerEngine,
     slots: Vec<SlotProc>,
     slot_of: [Option<usize>; INSTRUMENTS],
     shared: Arc<RackShared>,
@@ -372,6 +387,7 @@ impl Processor {
     fn new(
         song: Arc<Song>,
         slots: &[Slot],
+        samplers: Arc<SamplerSet>,
         shared: Arc<RackShared>,
         sample_rate: f64,
         note_offset: i16,
@@ -382,6 +398,7 @@ impl Processor {
         }
         Processor {
             seq: Sequencer::new(song),
+            sampler: SamplerEngine::new(samplers, sample_rate),
             slots: slots.iter().map(|s| SlotProc::new(&s.plugin)).collect(),
             slot_of,
             shared,
@@ -453,18 +470,21 @@ impl Processor {
                     Command::Mutes(m, s) => self.seq.set_mutes(m, s),
                     Command::Preview(inst, note, on) => self.seq_events.push(if on {
                         SeqEvent::NoteOn {
-                            track: 0,
+                            track: TRACKS as u8,
                             instrument: inst,
                             note,
                             velocity: 0.8,
+                            fx: Default::default(),
                         }
                     } else {
                         SeqEvent::NoteOff {
-                            track: 0,
+                            track: TRACKS as u8,
                             instrument: inst,
                             note,
                         }
                     }),
+                    Command::Samplers(set) => self.sampler.set_samplers(set),
+                    Command::Audition(sample) => self.sampler.audition(sample),
                     Command::Param(inst, change) => {
                         if let Some(i) = self.slot_of[inst as usize] {
                             self.slots[i].events.push_at(HostEvent::Param(change), 0);
@@ -482,6 +502,8 @@ impl Processor {
             t += samples_per_tick(self.seq.tempo(), self.sample_rate);
         }
         self.until_tick = (t - frames as f64).max(0.0);
+
+        self.sampler.process(self.seq.song(), frames, &mut self.mix);
 
         for s in &mut self.slots {
             if !s.process(frames, self.steady_time) {
@@ -506,14 +528,41 @@ impl Processor {
         for e in self.seq_events.drain(..) {
             let (inst, note, on, velocity) = match e {
                 SeqEvent::NoteOn {
+                    track,
                     instrument,
                     note,
                     velocity,
-                    ..
-                } => (instrument, note, true, velocity),
+                    fx,
+                } => {
+                    if self.sampler.plays(instrument) {
+                        let v = track as usize;
+                        self.sampler
+                            .note_on_fx(time, v, instrument, note, velocity, fx);
+                        continue;
+                    }
+                    (instrument, note, true, velocity)
+                }
                 SeqEvent::NoteOff {
-                    instrument, note, ..
-                } => (instrument, note, false, 0.0),
+                    track,
+                    instrument,
+                    note,
+                } => {
+                    if self.sampler.plays(instrument) {
+                        self.sampler.note_off(time, track as usize);
+                        continue;
+                    }
+                    (instrument, note, false, 0.0)
+                }
+                SeqEvent::Fx {
+                    track,
+                    instrument,
+                    fx,
+                } => {
+                    if self.sampler.plays(instrument) {
+                        self.sampler.fx(time, track as usize, instrument, fx);
+                    }
+                    continue;
+                }
             };
             let Some(i) = self.slot_of[inst as usize] else {
                 continue;
@@ -555,6 +604,7 @@ impl Rack {
     pub fn start(
         song: Arc<Song>,
         slots: &mut [Slot],
+        samplers: Arc<SamplerSet>,
         use_device: bool,
         settings: &AudioSettings,
         note_offset: i16,
@@ -562,7 +612,8 @@ impl Rack {
         let shared = RackShared::new(song.tempo);
         let mut problem = None;
         if use_device {
-            match Self::start_device(song.clone(), slots, shared.clone(), settings, note_offset) {
+            let s = (song.clone(), samplers.clone());
+            match Self::start_device(s, slots, shared.clone(), settings, note_offset) {
                 Ok(r) => return Ok((r, None)),
                 Err(e) => {
                     deactivate(slots);
@@ -570,12 +621,12 @@ impl Rack {
                 }
             }
         }
-        let r = Self::start_timer(song, slots, shared, note_offset)?;
+        let r = Self::start_timer((song, samplers), slots, shared, note_offset)?;
         Ok((r, problem))
     }
 
     fn start_device(
-        song: Arc<Song>,
+        (song, samplers): (Arc<Song>, Arc<SamplerSet>),
         slots: &mut [Slot],
         shared: Arc<RackShared>,
         settings: &AudioSettings,
@@ -592,7 +643,14 @@ impl Rack {
         let channels = config.channels as usize;
         let output_name = device.name().unwrap_or_else(|_| "default output".into());
         activate(slots, sample_rate)?;
-        let p = Processor::new(song, slots, shared.clone(), sample_rate as f64, note_offset);
+        let p = Processor::new(
+            song,
+            slots,
+            samplers,
+            shared.clone(),
+            sample_rate as f64,
+            note_offset,
+        );
         let stream = match format {
             cpal::SampleFormat::F32 => build::<f32>(&device, config, p, channels),
             cpal::SampleFormat::F64 => build::<f64>(&device, config, p, channels),
@@ -612,14 +670,21 @@ impl Rack {
 
     /// Process in real time without a sound card.
     fn start_timer(
-        song: Arc<Song>,
+        (song, samplers): (Arc<Song>, Arc<SamplerSet>),
         slots: &mut [Slot],
         shared: Arc<RackShared>,
         note_offset: i16,
     ) -> Result<Rack> {
         let sample_rate = 48_000;
         activate(slots, sample_rate)?;
-        let mut p = Processor::new(song, slots, shared.clone(), sample_rate as f64, note_offset);
+        let mut p = Processor::new(
+            song,
+            slots,
+            samplers,
+            shared.clone(),
+            sample_rate as f64,
+            note_offset,
+        );
         let block = 512usize;
         let thread_shared = shared.clone();
         let handle = std::thread::Builder::new()
@@ -709,9 +774,11 @@ where
 
 /// Render `seconds` of the song from `row` into a 16-bit stereo WAV file,
 /// plus a short tail after the notes stop. Runs faster than real time.
+#[allow(clippy::too_many_arguments)]
 pub fn render_wav(
     song: Arc<Song>,
     slots: &mut [Slot],
+    samplers: Arc<SamplerSet>,
     row: usize,
     seconds: f64,
     sample_rate: u32,
@@ -720,7 +787,14 @@ pub fn render_wav(
 ) -> Result<()> {
     let shared = RackShared::new(song.tempo);
     activate(slots, sample_rate)?;
-    let p = Processor::new(song, slots, shared.clone(), sample_rate as f64, note_offset);
+    let p = Processor::new(
+        song,
+        slots,
+        samplers,
+        shared.clone(),
+        sample_rate as f64,
+        note_offset,
+    );
     shared.play_from(row);
     let total = (seconds * sample_rate as f64) as usize;
     let tail = sample_rate as usize;

@@ -7,11 +7,15 @@
 //! song row; when that row is empty it jumps back to the first row of its
 //! block (the rows since the last empty one), so a block loops.
 //!
-//! Effects handled so far: DEL, GRV, HOP, KIL and TPO. Others are ignored.
+//! Effects handled so far: DEL, GRV, HOP, KIL and TPO. Instrument effects
+//! (0x80 and up) go along with the notes, for the built-in sampler. Others
+//! are ignored.
 
 use std::sync::Arc;
 
-use super::format::{Song, CHAINS, EMPTY, GROOVES, INSTRUMENTS, PHRASES, SONG_ROWS, STEPS, TRACKS};
+use super::format::{
+    Fx, Song, CHAINS, EMPTY, GROOVES, INSTRUMENTS, INSTRUMENT_FX, PHRASES, SONG_ROWS, STEPS, TRACKS,
+};
 
 pub const TICKS_PER_BEAT: f64 = 24.0;
 
@@ -29,12 +33,34 @@ pub enum SeqEvent {
         instrument: u8,
         note: i16,
         velocity: f64,
+        /// The step's instrument effects (0x80 and up; others are EMPTY).
+        fx: [Fx; 3],
     },
     NoteOff {
         track: u8,
         instrument: u8,
         note: i16,
     },
+    /// Instrument effects on a step without a note, for the note playing.
+    Fx {
+        track: u8,
+        instrument: u8,
+        fx: [Fx; 3],
+    },
+}
+
+/// The step's instrument effects, with the others blanked.
+fn instrument_fx(fx: [Fx; 3]) -> [Fx; 3] {
+    fx.map(|f| {
+        if f.command >= INSTRUMENT_FX && f.command != EMPTY {
+            f
+        } else {
+            Fx {
+                command: EMPTY,
+                value: 0,
+            }
+        }
+    })
 }
 
 /// Where a track is in the arrangement.
@@ -73,6 +99,10 @@ struct Track {
     playing: Option<(u8, i16)>,
     /// A note waiting for its tick (DEL): (tick, instrument, note, velocity).
     trigger: Option<(u32, u8, i16, f64)>,
+    /// Instrument effects of the step, sent with its note.
+    fx: [Fx; 3],
+    /// Effects to send at the step's start, when it has no note.
+    fx_pending: bool,
     /// Tick at which to cut the note (KIL, or an OFF note).
     kill: Option<u32>,
     hop: Option<u8>,
@@ -158,6 +188,10 @@ impl Sequencer {
         self.tempo
     }
 
+    pub fn song(&self) -> &Song {
+        &self.song
+    }
+
     pub fn is_playing(&self) -> bool {
         self.tracks.iter().any(|t| t.pos.is_some())
     }
@@ -202,6 +236,16 @@ impl Sequencer {
                 self.start_step(t);
             }
             let tr = self.tracks[t];
+            if tr.fx_pending {
+                self.tracks[t].fx_pending = false;
+                if self.audible(t) && tr.playing.is_some() {
+                    out.push(SeqEvent::Fx {
+                        track: t as u8,
+                        instrument: tr.instrument,
+                        fx: tr.fx,
+                    });
+                }
+            }
             if let Some((at, inst, note, velocity)) = tr.trigger {
                 if at == tr.tick && !self.audible(t) {
                     self.release(t, out);
@@ -213,6 +257,7 @@ impl Sequencer {
                         instrument: inst,
                         note,
                         velocity,
+                        fx: tr.fx,
                     });
                     self.tracks[t].playing = Some((inst, note));
                     self.tracks[t].trigger = None;
@@ -275,6 +320,8 @@ impl Sequencer {
         if (step.instrument as usize) < INSTRUMENTS {
             tr.instrument = step.instrument;
         }
+        tr.fx = instrument_fx(step.fx);
+        tr.fx_pending = step.note == EMPTY && tr.fx.iter().any(|f| f.command != EMPTY);
         match step.note {
             EMPTY => {}
             n if n >= 0x80 => {
@@ -489,6 +536,43 @@ mod tests {
         assert!(log
             .iter()
             .any(|&(i, e)| i == 8 && matches!(e, SeqEvent::NoteOff { note: 37, .. })));
+    }
+
+    #[test]
+    fn instrument_effects_go_with_notes() {
+        let mut s = blank();
+        s.rows[0][0] = 0;
+        s.chains[0].steps[0].phrase = 0;
+        set_note(&mut s, 0, 0, 36, 0);
+        s.phrases[0].steps[0].fx = [
+            Fx {
+                command: 0x84,
+                value: 0x40,
+            },
+            Fx {
+                command: FX_DEL,
+                value: 1,
+            },
+            Fx::default(),
+        ];
+        s.phrases[0].steps[1].fx[2] = Fx {
+            command: 0x89,
+            value: 0x20,
+        };
+        let log = run(s, 12);
+        match log[0].1 {
+            SeqEvent::NoteOn { fx, .. } => {
+                assert_eq!(fx[0].command, 0x84);
+                assert_eq!(fx[1].command, EMPTY, "sequencer effects are left out");
+            }
+            e => panic!("{e:?}"),
+        }
+        assert_eq!(log[0].0, 1, "with the delayed note");
+        assert!(
+            log.iter()
+                .any(|&(i, e)| i == 6
+                    && matches!(e, SeqEvent::Fx { fx, .. } if fx[2].command == 0x89))
+        );
     }
 
     #[test]

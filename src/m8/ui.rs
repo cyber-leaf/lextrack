@@ -17,12 +17,18 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::Terminal;
 
 use super::format::{
-    fx_name, note_name, InstrumentKind, Song, CHAINS, EMPTY, GROOVES, INSTRUMENTS, PHRASES, SEQ_FX,
-    SONG_ROWS, STEPS, TABLES, TRACKS,
+    fx_commands, fx_name, note_name, InstrumentKind, SamplerParams, Song, CHAINS, EMPTY, GROOVES,
+    INSTRUMENTS, PHRASES, SEQ_FX, SONG_ROWS, STEPS, S_AMP, S_CHORUS, S_CUTOFF, S_DEGRADE, S_DELAY,
+    S_DRY, S_ENV, S_FILTER, S_LENGTH, S_LFO, S_LIMIT, S_LOOP, S_PAN, S_PLAY, S_RES, S_REVERB,
+    S_SLICE, S_START, TABLES, TRACKS,
 };
 use super::input::{Button, Input, Keys, Press, RELEASE_EVENTS};
 use super::instruments::{InstrumentMap, PluginRef};
 use super::rack::{load_slots_reusing, render_wav, wanted_instruments, Rack, Slot};
+use super::sampler::{
+    self, card_root, resolve_sample_path, sample_path_for, SampleBank, SamplerSet, FILTERS,
+    LFO_SHAPES, LFO_TRIGGERS, LIMITS, MOD_DESTS, PLAY_MODES,
+};
 use super::screen::{Role, Screen, ROWS};
 use super::sequencer::Pos;
 use crate::audio;
@@ -215,6 +221,12 @@ enum Modal {
         list: Vec<PathBuf>,
         cur: usize,
     },
+    Samples {
+        instrument: u8,
+        dir: PathBuf,
+        list: Vec<PathBuf>,
+        cur: usize,
+    },
     Text {
         label: &'static str,
         value: String,
@@ -230,6 +242,69 @@ enum TextTarget {
 
 /// Instrument view rows before the plugin parameters.
 const INST_FIELDS: usize = 5;
+
+/// How a sampler setting is shown.
+#[derive(Clone, Copy)]
+enum Show {
+    Hex,
+    Names(&'static [&'static str]),
+    /// 00 is OFF.
+    Slice,
+}
+
+/// The sampler's rows on the instrument view, after the common ones:
+/// (label, setting number for [`crate::m8::format::Instrument::sampler_param`],
+/// display).
+const SAMPLER_ROWS: [(&str, usize, Show); 39] = [
+    ("VOLUME", 0, Show::Hex),
+    ("PITCH", 1, Show::Hex),
+    ("FINE TUNE", 2, Show::Hex),
+    ("PLAY", 3 + S_PLAY, Show::Names(&PLAY_MODES)),
+    ("SLICE", 3 + S_SLICE, Show::Slice),
+    ("START", 3 + S_START, Show::Hex),
+    ("LOOP ST", 3 + S_LOOP, Show::Hex),
+    ("LENGTH", 3 + S_LENGTH, Show::Hex),
+    ("DEGRADE", 3 + S_DEGRADE, Show::Hex),
+    ("FILTER", 3 + S_FILTER, Show::Names(&FILTERS)),
+    ("CUTOFF", 3 + S_CUTOFF, Show::Hex),
+    ("RES", 3 + S_RES, Show::Hex),
+    ("AMP", 3 + S_AMP, Show::Hex),
+    ("LIMIT", 3 + S_LIMIT, Show::Names(&LIMITS)),
+    ("PAN", 3 + S_PAN, Show::Hex),
+    ("DRY", 3 + S_DRY, Show::Hex),
+    ("CHORUS", 3 + S_CHORUS, Show::Hex),
+    ("DELAY", 3 + S_DELAY, Show::Hex),
+    ("REVERB", 3 + S_REVERB, Show::Hex),
+    ("ENV1 DEST", 3 + S_ENV, Show::Names(&MOD_DESTS)),
+    ("ENV1 AMT", 3 + S_ENV + 1, Show::Hex),
+    ("ENV1 ATK", 3 + S_ENV + 2, Show::Hex),
+    ("ENV1 HOLD", 3 + S_ENV + 3, Show::Hex),
+    ("ENV1 DEC", 3 + S_ENV + 4, Show::Hex),
+    ("ENV2 DEST", 3 + S_ENV + 6, Show::Names(&MOD_DESTS)),
+    ("ENV2 AMT", 3 + S_ENV + 7, Show::Hex),
+    ("ENV2 ATK", 3 + S_ENV + 8, Show::Hex),
+    ("ENV2 HOLD", 3 + S_ENV + 9, Show::Hex),
+    ("ENV2 DEC", 3 + S_ENV + 10, Show::Hex),
+    ("LFO1 SHAPE", 3 + S_LFO, Show::Names(&LFO_SHAPES)),
+    ("LFO1 DEST", 3 + S_LFO + 1, Show::Names(&MOD_DESTS)),
+    ("LFO1 TRIG", 3 + S_LFO + 2, Show::Names(&LFO_TRIGGERS)),
+    ("LFO1 FREQ", 3 + S_LFO + 3, Show::Hex),
+    ("LFO1 AMT", 3 + S_LFO + 4, Show::Hex),
+    ("LFO2 SHAPE", 3 + S_LFO + 6, Show::Names(&LFO_SHAPES)),
+    ("LFO2 DEST", 3 + S_LFO + 7, Show::Names(&MOD_DESTS)),
+    ("LFO2 TRIG", 3 + S_LFO + 8, Show::Names(&LFO_TRIGGERS)),
+    ("LFO2 FREQ", 3 + S_LFO + 9, Show::Hex),
+    ("LFO2 AMT", 3 + S_LFO + 10, Show::Hex),
+];
+
+/// A new sampler's value for a setting number.
+fn sampler_default(i: usize) -> u8 {
+    match i {
+        0 | 1 => 0,
+        2 => 0x80,
+        _ => SamplerParams::default().0[i - 3],
+    }
+}
 
 /// Project view rows: (label, screen row).
 const PROJECT_FIELDS: [(&str, usize); 9] = [
@@ -260,6 +335,10 @@ pub struct App {
     map: InstrumentMap,
     slots: Vec<Slot>,
     missing: Vec<(u8, String)>,
+    /// Samples for the built-in sampler, and the ones that didn't load.
+    bank: SampleBank,
+    samplers: Arc<SamplerSet>,
+    sample_problems: Vec<(u8, String)>,
     rack: Option<Rack>,
     use_device: bool,
     audio: AudioSettings,
@@ -312,6 +391,9 @@ impl App {
             map: o.map,
             slots: Vec::new(),
             missing: Vec::new(),
+            bank: SampleBank::default(),
+            samplers: Arc::new(SamplerSet::default()),
+            sample_problems: Vec::new(),
             rack: None,
             use_device: o.use_device,
             audio: o.audio,
@@ -410,8 +492,11 @@ impl App {
             self.dirty = false;
             if self.needs_new_plugins() {
                 self.rebuild_audio();
-            } else if let Some(r) = &self.rack {
-                r.shared.set_song(Arc::new(self.song.clone()));
+            } else {
+                self.sync_samplers();
+                if let Some(r) = &self.rack {
+                    r.shared.set_song(Arc::new(self.song.clone()));
+                }
             }
         }
         if let Some((at, inst, note)) = self.preview {
@@ -451,6 +536,24 @@ impl App {
             .any(|n| !have.contains(&n))
     }
 
+    fn song_dir(&self) -> PathBuf {
+        super::app::song_dir(self.path.as_deref())
+    }
+
+    /// Load the samples the built-in sampler needs, and hand them to the
+    /// audio thread when they changed.
+    fn sync_samplers(&mut self) {
+        let (set, problems) =
+            SamplerSet::build(&self.song, &self.song_dir(), &self.map, &mut self.bank);
+        self.sample_problems = problems;
+        if !set.same_as(&self.samplers) {
+            self.samplers = Arc::new(set);
+            if let Some(r) = &self.rack {
+                r.shared.set_samplers(self.samplers.clone());
+            }
+        }
+    }
+
     fn stop_audio(&mut self) {
         if let Some(mut r) = self.rack.take() {
             r.stop(&mut self.slots);
@@ -482,9 +585,11 @@ impl App {
         self.slots = slots;
         self.missing = missing;
         self.params_for = None;
+        self.sync_samplers();
         match Rack::start(
             Arc::new(self.song.clone()),
             &mut self.slots,
+            self.samplers.clone(),
             self.use_device,
             &self.audio,
             self.note_offset,
@@ -574,6 +679,9 @@ impl App {
     /// Rows and columns the cursor can visit.
     fn extent(&self) -> (usize, usize) {
         match self.view {
+            View::Instrument if self.is_sampler(self.instrument) => {
+                (INST_FIELDS + SAMPLER_ROWS.len(), 1)
+            }
             View::Instrument => (INST_FIELDS + self.params.len(), 1),
             View::Project => (PROJECT_FIELDS.len(), 1),
             _ => self.grid().map_or((1, 1), |(r, c)| (r, c.len())),
@@ -1053,7 +1161,12 @@ impl App {
             return;
         }
         let d = delta_for(kind.big_step());
-        let v = if kind == Kind::Transpose {
+        let v = if kind == Kind::FxCmd {
+            // Sequencer effects, then the instrument (sampler) effects.
+            let all: Vec<u8> = fx_commands().collect();
+            let i = all.iter().position(|&c| c == val).unwrap_or(0) as i32;
+            all[(i + d).clamp(0, all.len() as i32 - 1) as usize]
+        } else if kind == Kind::Transpose {
             (val as i32 + d).rem_euclid(256) as u8
         } else {
             (val as i32 + d).clamp(0, kind.max() as i32) as u8
@@ -1320,6 +1433,7 @@ impl App {
     fn instrument_edit(&mut self, delta: i32) {
         let n = self.instrument;
         let row = self.cur().row;
+        let sampler = self.is_sampler(n);
         let inst = &mut self.song.instruments[n as usize];
         match row {
             0 => {
@@ -1333,7 +1447,7 @@ impl App {
                 ];
                 let i = KINDS.iter().position(|k| *k == inst.kind).unwrap_or(5) as i32;
                 let i = (i + delta.signum()).rem_euclid(KINDS.len() as i32);
-                inst.kind = KINDS[i as usize];
+                inst.set_kind(KINDS[i as usize]);
                 self.changed();
             }
             1 if delta == 0 => {
@@ -1343,6 +1457,8 @@ impl App {
                     target: TextTarget::InstrumentName(n),
                 })
             }
+            2 if delta == 0 && sampler => self.open_sample_browser(n),
+            2 if sampler => self.step_sample(n, delta),
             2 if delta == 0 => self.open_plugin_browser(n),
             2 => self.step_plugin(n, delta),
             3 if delta != 0 => {
@@ -1353,6 +1469,9 @@ impl App {
                 inst.table_tick = (inst.table_tick as i32 + delta).clamp(0, 0xFF) as u8;
                 self.changed();
             }
+            r if r >= INST_FIELDS && delta != 0 && sampler => {
+                self.nudge_sampler(r - INST_FIELDS, delta)
+            }
             r if r >= INST_FIELDS && delta != 0 => self.nudge_param(r - INST_FIELDS, delta),
             _ => {}
         }
@@ -1362,7 +1481,18 @@ impl App {
     /// a parameter goes back to its default.
     fn instrument_reset(&mut self) {
         let n = self.instrument;
+        let sampler = self.is_sampler(n);
         match self.cur().row {
+            2 if sampler => {
+                self.song.instruments[n as usize].sample_path.clear();
+                self.changed();
+            }
+            r if r >= INST_FIELDS && sampler => {
+                if let Some(&(_, i, _)) = SAMPLER_ROWS.get(r - INST_FIELDS) {
+                    self.song.instruments[n as usize].set_sampler_param(i, sampler_default(i));
+                    self.changed();
+                }
+            }
             2 => {
                 self.map.set_number(n, None);
                 self.map.states.remove(&n);
@@ -1425,6 +1555,136 @@ impl App {
         self.param_hold
             .insert((n, p.id), (v, Instant::now() + Duration::from_millis(300)));
         self.unsaved = true;
+    }
+
+    /// Whether the built-in sampler plays instrument `n`.
+    fn is_sampler(&self, n: u8) -> bool {
+        self.map
+            .builtin_sampler(n, &self.song.instruments[n as usize])
+    }
+
+    fn nudge_sampler(&mut self, row: usize, delta: i32) {
+        let Some(&(_, i, show)) = SAMPLER_ROWS.get(row) else {
+            return;
+        };
+        let inst = &mut self.song.instruments[self.instrument as usize];
+        let v = inst.sampler_param(i) as i32;
+        let next = match show {
+            Show::Names(names) => (v + delta.signum()).clamp(0, names.len() as i32 - 1),
+            Show::Hex | Show::Slice => (v + delta).clamp(0, 0xFF),
+        };
+        inst.set_sampler_param(i, next as u8);
+        self.changed();
+    }
+
+    /// The card root and the song's folder, for sample paths.
+    fn sample_dirs(&self) -> (PathBuf, PathBuf) {
+        let dir = self.song_dir();
+        (card_root(&dir, &self.song.directory), dir)
+    }
+
+    /// The file instrument `n` plays, if it is found.
+    fn sample_file(&self, n: u8) -> Option<PathBuf> {
+        let (root, dir) = self.sample_dirs();
+        resolve_sample_path(&root, &dir, &self.song.instruments[n as usize].sample_path)
+    }
+
+    fn open_sample_browser(&mut self, instrument: u8) {
+        let (root, dir) = self.sample_dirs();
+        let file = self.sample_file(instrument);
+        let start = file
+            .as_ref()
+            .and_then(|f| f.parent().map(|d| d.to_path_buf()))
+            .or_else(|| Some(root.join("Samples")).filter(|d| d.is_dir()))
+            .unwrap_or(dir);
+        self.browse_samples(instrument, start, file);
+    }
+
+    fn browse_samples(&mut self, instrument: u8, dir: PathBuf, select: Option<PathBuf>) {
+        let mut list = vec![dir.join("..")];
+        list.extend(dir_entries(&dir, is_wav));
+        let cur = select
+            .and_then(|f| list.iter().position(|p| *p == f))
+            .unwrap_or(0);
+        self.modal = Some(Modal::Samples {
+            instrument,
+            dir,
+            list,
+            cur,
+        });
+        self.audition_cursor();
+    }
+
+    /// In the sample browser: play the file under the cursor.
+    fn audition_cursor(&mut self) {
+        let Some(Modal::Samples { list, cur, .. }) = &self.modal else {
+            return;
+        };
+        let file = list[*cur].clone();
+        self.audition(Some(&file));
+    }
+
+    /// Play a sample file as it is, or stop (`None`, or not a sample).
+    fn audition(&mut self, file: Option<&std::path::Path>) {
+        let sample = match file.filter(|f| is_wav(f) && f.is_file()) {
+            Some(f) => match self.bank.get(f) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    self.flash(e);
+                    None
+                }
+            },
+            None => None,
+        };
+        if let Some(r) = &self.rack {
+            r.shared.audition(sample);
+        }
+    }
+
+    /// EDIT+LEFT/RIGHT on SAMPLE: the previous or next file in its folder.
+    fn step_sample(&mut self, instrument: u8, delta: i32) {
+        let Some(file) = self.sample_file(instrument) else {
+            return self.open_sample_browser(instrument);
+        };
+        let dir = file.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+        let files: Vec<PathBuf> = dir_entries(&dir, is_wav)
+            .into_iter()
+            .filter(|p| p.is_file())
+            .collect();
+        let Some(i) = files.iter().position(|p| *p == file) else {
+            return;
+        };
+        let j = (i as i32 + delta.signum()).clamp(0, files.len() as i32 - 1) as usize;
+        if j != i {
+            self.choose_sample(instrument, &files[j]);
+            self.audition(Some(&files[j]));
+        }
+    }
+
+    /// Give `instrument` a sample file. A name taken from the old sample's
+    /// file follows the new one.
+    fn choose_sample(&mut self, instrument: u8, file: &std::path::Path) {
+        let (root, _) = self.sample_dirs();
+        let path = sample_path_for(&root, file);
+        if path.len() > 127 {
+            return self.flash("PATH TOO LONG FOR AN M8 SONG (127 MAX)");
+        }
+        let stem = |p: &std::path::Path| -> String {
+            p.file_stem()
+                .map(|s| s.to_string_lossy().to_uppercase())
+                .unwrap_or_default()
+                .chars()
+                .take(12)
+                .collect()
+        };
+        let inst = &mut self.song.instruments[instrument as usize];
+        inst.set_kind(InstrumentKind::Sampler);
+        let old = stem(std::path::Path::new(&inst.sample_path));
+        if inst.name.is_empty() || (!old.is_empty() && inst.name == old) {
+            inst.name = stem(file);
+        }
+        inst.sample_path = path;
+        self.changed();
     }
 
     /// Every plugin in the standard CLAP folders and `$CLAP_PATH`, plus the
@@ -1507,7 +1767,7 @@ impl App {
         self.map.states.remove(&instrument);
         let inst = &mut self.song.instruments[instrument as usize];
         if inst.kind == InstrumentKind::None {
-            inst.kind = InstrumentKind::Wavsynth;
+            inst.set_kind(InstrumentKind::Wavsynth);
         }
         if inst.name.is_empty() {
             inst.name = d.name.to_uppercase().chars().take(12).collect();
@@ -1646,17 +1906,9 @@ impl App {
 
     fn browse_songs(&mut self, dir: PathBuf) {
         let mut list = vec![dir.join("..")];
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            let mut entries: Vec<PathBuf> = rd
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.is_dir() || p.extension().is_some_and(|e| e.eq_ignore_ascii_case("m8s"))
-                })
-                .collect();
-            entries.sort();
-            list.extend(entries);
-        }
+        list.extend(dir_entries(&dir, |p| {
+            p.extension().is_some_and(|e| e.eq_ignore_ascii_case("m8s"))
+        }));
         self.modal = Some(Modal::Songs { dir, list, cur: 0 });
     }
 
@@ -1711,6 +1963,7 @@ impl App {
         let r = render_wav(
             Arc::new(self.song.clone()),
             &mut self.slots,
+            self.samplers.clone(),
             0,
             self.render_seconds as f64,
             rate,
@@ -1730,18 +1983,30 @@ impl App {
         let Some(modal) = self.modal.as_mut() else {
             return;
         };
+        let samples = matches!(modal, Modal::Samples { .. });
         let (len, cur) = match modal {
             Modal::Plugins { list, cur, .. } => (list.len(), cur),
             Modal::Songs { list, cur, .. } => (list.len(), cur),
+            Modal::Samples { list, cur, .. } => (list.len(), cur),
             Modal::Text { .. } => return,
         };
         let page = if p.held.option { 16 } else { 1 };
+        let before = *cur;
         match p.button {
             Button::Up => *cur = cur.saturating_sub(page),
             Button::Down => *cur = (*cur + page).min(len.saturating_sub(1)),
-            Button::Option if p.held.none() => self.modal = None,
+            Button::Option if p.held.none() => {
+                self.modal = None;
+                if samples {
+                    self.audition(None);
+                }
+            }
             Button::Edit if p.held.none() => self.modal_choose(),
+            Button::Play if samples => self.audition_cursor(),
             _ => {}
+        }
+        if matches!(&self.modal, Some(Modal::Samples { cur, .. }) if *cur != before) {
+            self.audition_cursor();
         }
     }
 
@@ -1752,6 +2017,22 @@ impl App {
                 list,
                 cur,
             }) => self.choose_plugin(instrument, &list[cur]),
+            Some(Modal::Samples {
+                instrument,
+                list,
+                cur,
+                dir,
+            }) => {
+                let p = list[cur].clone();
+                if p.is_dir() {
+                    let back = p.ends_with("..").then(|| dir.canonicalize().unwrap_or(dir));
+                    let next = p.canonicalize().unwrap_or(p);
+                    self.browse_samples(instrument, next, back);
+                } else {
+                    self.choose_sample(instrument, &p);
+                    self.audition(None);
+                }
+            }
             Some(Modal::Songs { list, cur, .. }) => {
                 let p = list[cur].clone();
                 if p.is_dir() {
@@ -1803,6 +2084,25 @@ impl App {
                     .map(|d| (d.name.clone(), d.vendor.clone()))
                     .collect();
                 draw_list(s, "CLAP PLUGINS", &rows, *cur);
+                self.draw_status(s);
+                return;
+            }
+            Some(Modal::Samples { list, cur, dir, .. }) => {
+                let rows: Vec<(String, String)> = list
+                    .iter()
+                    .map(|p| {
+                        let name = if p.ends_with("..") {
+                            "/..".to_string()
+                        } else {
+                            file_name(p)
+                        };
+                        let dir = if p.is_dir() { "DIR" } else { "" };
+                        (name, dir.to_string())
+                    })
+                    .collect();
+                let title = format!("SAMPLES {}", file_name(dir));
+                draw_list(s, &title, &rows, *cur);
+                s.text(0, 22, "PLAY LISTENS AGAIN", Role::Info);
                 self.draw_status(s);
                 return;
             }
@@ -2076,10 +2376,24 @@ impl App {
         } else {
             inst.name.clone()
         };
+        let sampler = self.is_sampler(n);
+        let (source_label, plugin) = if sampler {
+            let file = std::path::Path::new(&inst.sample_path)
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned());
+            let shown = match (file, self.sample_problems.iter().find(|m| m.0 == n)) {
+                (_, Some((_, why))) => format!("! {why}"),
+                (Some(f), None) => f,
+                (None, None) => "--".into(),
+            };
+            ("SAMPLE", shown.to_uppercase())
+        } else {
+            ("PLUGIN", plugin)
+        };
         let fields = [
             ("TYPE", kind),
             ("NAME", name),
-            ("PLUGIN", plugin),
+            (source_label, plugin),
             ("TRANSP.", if inst.transpose { "ON" } else { "OFF" }.into()),
             ("TBL. TIC", format!("{:02X}", inst.table_tick)),
         ];
@@ -2095,6 +2409,9 @@ impl App {
         }
         if c.row == 2 {
             s.text(0, 7, "EDIT: LIST, EDIT+L/R: NEXT", Role::Info);
+        }
+        if sampler {
+            return self.draw_sampler(s, c.row);
         }
         if self.params.is_empty() {
             let msg = if self.slot(n).is_some() {
@@ -2139,6 +2456,48 @@ impl App {
             s.text(17, y, &text, role);
             if c.row == INST_FIELDS + k {
                 s.highlight(17, y, text.chars().count().max(2), Role::Cursor);
+            }
+        }
+    }
+
+    /// The sampler's waveform and settings, below the common rows.
+    fn draw_sampler(&mut self, s: &mut Screen, cur_row: usize) {
+        let n = self.instrument;
+        let inst = self.song.instruments[n as usize].clone();
+        match self.samplers.samples[n as usize].clone() {
+            Some(sample) => draw_wave(s, 8, PANEL_X - 1, &sample, &inst),
+            None if cur_row != 2 => s.text(0, 8, "EDIT ON SAMPLE TO CHOOSE ONE", Role::Info),
+            None => {}
+        }
+        let visible = 12;
+        if cur_row >= INST_FIELDS {
+            let i = cur_row - INST_FIELDS;
+            if i < self.inst_top {
+                self.inst_top = i;
+            } else if i >= self.inst_top + visible {
+                self.inst_top = i + 1 - visible;
+            }
+        }
+        for (k, &(label, i, show)) in SAMPLER_ROWS
+            .iter()
+            .enumerate()
+            .skip(self.inst_top)
+            .take(visible)
+        {
+            let y = 11 + k - self.inst_top;
+            s.text(0, y, label, Role::Default);
+            let v = inst.sampler_param(i);
+            let text = match show {
+                Show::Hex => format!("{v:02X}"),
+                Show::Slice if v == 0 => "OFF".into(),
+                Show::Slice => format!("{v:02X}"),
+                Show::Names(names) => names
+                    .get(v as usize)
+                    .map_or(format!("{v:02X}"), |s| s.to_string()),
+            };
+            s.text(11, y, &text, Role::Value);
+            if cur_row == INST_FIELDS + k {
+                s.highlight(11, y, text.chars().count().max(2), Role::Cursor);
             }
         }
     }
@@ -2333,6 +2692,91 @@ fn draw_list(s: &mut Screen, title: &str, rows: &[(String, String)], cur: usize)
     s.text(0, 21, "EDIT CHOOSES, OPTION GOES BACK", Role::Info);
 }
 
+/// A folder's subfolders, then its files that pass `keep`, sorted by name.
+fn dir_entries(dir: &std::path::Path, keep: impl Fn(&std::path::Path) -> bool) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    for p in rd.flatten().map(|e| e.path()) {
+        let hidden = p
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with('.'));
+        if hidden {
+            continue;
+        }
+        if p.is_dir() {
+            dirs.push(p);
+        } else if keep(&p) {
+            files.push(p);
+        }
+    }
+    let key = |p: &PathBuf| file_name(p).to_lowercase();
+    dirs.sort_by_key(key);
+    files.sort_by_key(key);
+    dirs.extend(files);
+    dirs
+}
+
+fn is_wav(p: &std::path::Path) -> bool {
+    p.extension().is_some_and(|e| e.eq_ignore_ascii_case("wav"))
+}
+
+/// A sample's waveform on row `y`, `width` wide, with the part that plays
+/// bright and, below it, the start (S), loop (L) and end (E) points or the
+/// slices.
+fn draw_wave(
+    s: &mut Screen,
+    y: usize,
+    width: usize,
+    sample: &sampler::Sample,
+    inst: &crate::m8::format::Instrument,
+) {
+    const BARS: [char; 8] = [
+        '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}',
+        '\u{2588}',
+    ];
+    let peaks = sample.peaks(width);
+    let top = peaks.iter().fold(0.0f32, |m, &p| m.max(p)).max(1e-6);
+    let len = sample.frames().max(1) as f64;
+    let col = |frame: f64| ((frame / len * width as f64).max(0.0) as usize).min(width - 1);
+    let p = |i: usize| inst.sampler_param(i) as f64 / 255.0;
+    let slice = inst.sampler_param(3 + S_SLICE);
+    let (from, to) = if slice == 0 {
+        let start = len * p(3 + S_START);
+        let end = start + (len - start) * p(3 + S_LENGTH);
+        let lp = start + (end - start) * p(3 + S_LOOP);
+        if inst.sampler_param(3 + S_PLAY) >= 2 {
+            s.text(col(lp), y + 1, "L", Role::Info);
+        }
+        s.text(col(end - 1.0), y + 1, "E", Role::Info);
+        s.text(col(start), y + 1, "S", Role::Info);
+        (col(start), col(end - 1.0))
+    } else {
+        let count = if sample.cues.is_empty() {
+            slice as usize
+        } else {
+            sample.cues.len() + 1
+        };
+        for k in 0..count.min(width) {
+            let (a, _) = sample.region(slice, k as i16);
+            s.text(col(a as f64), y + 1, "|", Role::Info);
+        }
+        (0, width - 1)
+    };
+    for (x, pk) in peaks.iter().enumerate() {
+        let level = ((pk / top) * 7.0).round() as usize;
+        let role = if (from..=to).contains(&x) {
+            Role::Value
+        } else {
+            Role::Info
+        };
+        let ch = if *pk == 0.0 { ' ' } else { BARS[level.min(7)] };
+        s.text(x, y, &ch.to_string(), role);
+    }
+}
+
 fn file_name(p: &std::path::Path) -> String {
     p.file_name()
         .map(|f| f.to_string_lossy().into_owned())
@@ -2350,6 +2794,9 @@ mod tests {
             map: InstrumentMap::default(),
             slots: Vec::new(),
             missing: Vec::new(),
+            bank: SampleBank::default(),
+            samplers: Arc::new(SamplerSet::default()),
+            sample_problems: Vec::new(),
             rack: None,
             use_device: false,
             audio: AudioSettings::default(),
@@ -2496,6 +2943,69 @@ mod tests {
         let p = a.song.chains[0].steps[0].phrase;
         assert_ne!(p, 0);
         assert_eq!(a.song.phrases[p as usize].steps[0].note, 40);
+    }
+
+    #[test]
+    fn sampler_instrument() {
+        let dir = std::env::temp_dir().join(format!("lextrack-sampler-{}", std::process::id()));
+        let samples = dir.join("Samples");
+        std::fs::create_dir_all(&samples).unwrap();
+        std::fs::create_dir_all(dir.join("Songs")).unwrap();
+        let tone: Vec<f32> = (0..400).map(|i| (i as f32 * 0.1).sin()).collect();
+        for name in ["a.wav", "b.wav"] {
+            let bytes = crate::m8::sampler::tests::wav(std::slice::from_ref(&tone), 44_100, &[]);
+            std::fs::write(samples.join(name), bytes).unwrap();
+        }
+        let mut a = app();
+        a.path = Some(dir.join("Songs").join("X.m8s"));
+        a.view = View::Instrument;
+        a.choose_sample(0, &samples.join("a.wav"));
+        let inst = &a.song.instruments[0];
+        assert_eq!(inst.kind, InstrumentKind::Sampler);
+        assert_eq!(
+            (inst.name.as_str(), inst.sample_path.as_str()),
+            ("A", "/Samples/a.wav")
+        );
+        a.sync_samplers();
+        assert!(a.samplers.builtin[0] && a.samplers.samples[0].is_some());
+
+        // EDIT+RIGHT on SAMPLE: the next file, and the name follows it.
+        a.set_cur(Cursor { row: 2, col: 0 });
+        with(&mut a, Button::Right, |h| h.edit = true);
+        assert_eq!(a.song.instruments[0].sample_path, "/Samples/b.wav");
+        assert_eq!(a.song.instruments[0].name, "B");
+
+        // START is the sixth sampler row.
+        a.set_cur(Cursor {
+            row: INST_FIELDS + 5,
+            col: 0,
+        });
+        with(&mut a, Button::Up, |h| h.edit = true);
+        assert_eq!(a.song.instruments[0].sampler.0[S_START], 0x10);
+        with(&mut a, Button::Option, |h| h.edit = true);
+        assert_eq!(a.song.instruments[0].sampler.0[S_START], 0);
+
+        a.sync_samplers();
+        let mut s = Screen::new();
+        a.draw(&mut s);
+        assert!(s.row(4).starts_with("SAMPLE   B.WAV"), "{}", s.row(4));
+        assert!(s.row(9).starts_with('S'), "{}", s.row(9));
+        assert!(s.row(11).starts_with("VOLUME     00"), "{}", s.row(11));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn instrument_effects_can_be_picked() {
+        let mut a = app();
+        a.view = View::Phrase;
+        a.set_cur(Cursor { row: 0, col: 3 });
+        tap(&mut a, Button::Edit);
+        with(&mut a, Button::Up, |h| h.edit = true);
+        assert_eq!(a.song.phrases[0].steps[0].fx[0].command, 0x10);
+        with(&mut a, Button::Up, |h| h.edit = true);
+        // Past the sequencer effects come the sampler's, from 0x80.
+        assert_eq!(a.song.phrases[0].steps[0].fx[0].command, 0x89);
+        assert_eq!(fx_name(0x89), "CUT");
     }
 
     #[test]
