@@ -66,10 +66,10 @@ In the window, A, Z, X and S can be held like the M8's buttons: hold X and press
 | SHIFT + arrows | Move between views (see the map below) |
 | EDIT | On an empty cell, insert the last value used in that column. Press twice quickly on a chain, phrase or instrument number for a new, unused one |
 | EDIT + LEFT / RIGHT | Change the value by 1 |
-| EDIT + UP / DOWN | Change the value by 16 (an octave for notes) |
+| EDIT + UP / DOWN | Change the value by 16 (an octave for notes and transposes). On an effect, open the effect list: arrows move, EDIT or letting go of EDIT picks, OPTION leaves it unchanged |
 | EDIT + OPTION | Delete. On an empty note, insert a note off |
 | OPTION + UP / DOWN | Song: jump 16 rows. Chain: the chain on the previous or next song row. Phrase: the previous or next phrase in the chain |
-| OPTION + LEFT / RIGHT | Chain and phrase: the same row on the previous or next track. Instrument, table, groove: the previous or next number (UP / DOWN jump by 16) |
+| OPTION + LEFT / RIGHT | Chain and phrase: the previous or next track that has something on this row. Instrument, table, groove: the previous or next number (instrument and table: UP adds 16, DOWN takes 16 off) |
 | SHIFT + OPTION | Start a selection. Move to extend it, press SHIFT+OPTION again to widen it to whole columns, rows, then everything. OPTION copies, EDIT+OPTION cuts, SHIFT+EDIT clones the chain, phrase or instrument under the cursor |
 | SHIFT + EDIT | Paste |
 | PLAY | Song: play from the cursor row. Chain: loop the chain. Phrase: loop the phrase. Press again to stop |
@@ -90,14 +90,16 @@ LSCPIT       L  live          S  song          C  chain    P  phrase
  E           V  mixer         E  effects
 ```
 
-- **SONG**: eight tracks of chain numbers, 256 rows. SHIFT+RIGHT opens the chain under the cursor.
-- **CHAIN**: up to 16 phrases (PH) with a transpose each (TSP). SHIFT+RIGHT opens the phrase.
-- **PHRASE**: 16 steps of note (N), volume (V), instrument (I) and three effects. SHIFT+RIGHT opens the step's instrument; SHIFT+UP opens the groove.
+- **SONG**: eight tracks of chain numbers, 256 rows. SHIFT+RIGHT opens the chain under the cursor, or the nearest one above it in the track.
+- **CHAIN**: up to 16 phrases (PH) with a transpose each (TSP). SHIFT+RIGHT opens the phrase, or the nearest one above it.
+- **PHRASE**: 16 steps of note (N), volume (V), instrument (I) and three effects. SHIFT+RIGHT opens the step's instrument, or the table of a TBL effect under the cursor; SHIFT+UP opens the groove of the GRV effect on or above the row.
 - **INSTRUMENT**: the M8 type, name, transpose setting and table tick, and what plays it: the built-in sampler for SAMPLER instruments (see below), a CLAP plugin for the rest. Every instrument can use any installed plugin: EDIT on PLUGIN opens the list of installed plugins (the standard CLAP folders, `$CLAP_PATH`, and any plugin named on the command line or in the map), EDIT+LEFT/RIGHT steps through them, and EDIT+OPTION goes back to the shared default. `(DEF)` after a plugin name means the instrument uses the shared default. Below are the plugin's parameters, changed with EDIT+arrows and reset with EDIT+OPTION. SHIFT+RIGHT opens the instrument's table.
 - **INSTRUMENT, SAMPLER**: SAMPLE is the WAV file. EDIT on it opens a file browser that plays each file as the cursor reaches it (PLAY plays it again, EDIT picks it, OPTION goes back); EDIT+LEFT/RIGHT steps to the previous or next file in the same folder; EDIT+OPTION clears it. RIGHT moves to REC., where EDIT opens the recording screen (see below). Below it, the waveform with the start (S), loop (L) and end (E) points, or the slices, and the M8 sampler's settings: VOLUME, PITCH, FINE TUNE, PLAY mode, SLICE, START, LOOP ST, LENGTH, DEGRADE, FILTER, CUTOFF, RES, AMP, LIMIT, PAN, DRY, CHORUS, DELAY, REVERB, and two envelopes and two LFOs (destination, amount, attack / hold / decay, or shape / trigger / frequency). EDIT+arrows change them, EDIT+OPTION resets one.
-- **TABLE**: 16 steps of transpose, volume and three effects (edited and saved, but not played yet).
+- **TABLE**: 16 steps of transpose, volume and three effects (edited and saved, but not played yet). SHIFT+LEFT goes back to where you came from. Tables 00-7F belong to the instrument with the same number.
 - **GROOVE**: the ticks per step, with the total per phrase (96 is straight time).
 - **PROJECT**: tempo, transpose, name, SAVE / LOAD / NEW (press EDIT twice to drop unsaved changes), RENDER to a WAV file, and the audio output: device, sample rate and buffer size. APPLY restarts audio with them and saves them for next time.
+
+How these buttons were checked against the M8 firmware is in [docs/m8-firmware-ux.md](docs/m8-firmware-ux.md).
 
 The right-hand panel shows the output level, the tempo, and the note on each track, with M or S on muted and soloed tracks. Live, mixer, effects and instrument mods are dimmed on the map: they aren't there yet.
 
@@ -128,7 +130,7 @@ SAMPLER instruments play WAV files (8, 16, 24 or 32-bit, or float; mono or stere
 - **DEGRADE** lowers the sample rate and bit depth. **FILTER** is low, high or band pass or band stop, with CUTOFF and RES. **AMP** drives the sound into the **LIMIT**er: CLIP, SIN, FOLD, WRAP, or POST (clipped after the volume). **VOLUME** is attenuation: 00 is full volume, FF silent. **PAN** 80 is centre.
 - **Envelopes** (attack, hold, decay) and **LFOs** (20 shapes; FREE, RETRIG, HOLD or ONCE) modulate VOLUME, PITCH, LOOP ST, LENGTH, DEGRADE, CUTOFF, RES, AMP or PAN by their amount.
 - **Recording.** REC. on the SAMPLE row opens the M8's sample recording screen. **SRC** is `L&R` (both channels of the audio input), `INL` or `INR` (one channel, saved as a mono sample) or `MASTER` (lextrack's own output, for resampling). **DEVICE** picks the input device (DEFAULT is the system's). **VOL** is the input gain (80 is unity), shown on the LEVEL meter. **ARM** sets a level: with it on, EDIT on START waits until the sound gets that loud before it starts recording (ARMED), so the take starts on the first sound. **PLAY** plays the song from that song row while recording, and stops it at the end. EDIT on START records, EDIT again (or OPTION) stops; the take's waveform and length are shown, and PLAY listens to it. **NAME** names the file (REC000, REC001... by default) and **SAVE** writes `Samples/Recordings/NAME.wav` under the card root as a 16-bit WAV at the source's sample rate and loads it into the instrument. OPTION goes back (twice, if the take isn't saved). Takes stop at 10 minutes.
-- **Sampler effects** in phrases set a setting for the note on that step: `VOL PIT FIN PLY STA LOP LEN DEG FLT CUT RES AMP LIM PAN`, envelope and LFO amounts and times (`EA1 AT1 HO1 DE1 EA2`... `LA1 LF1 LT1`...) and `SLI`. On a step without a note they change the note already playing. EDIT+UP past the last sequencer effect reaches them.
+- **Sampler effects** in phrases set a setting for the note on that step: `VOL PIT FIN PLY STA LOP LEN DEG FLT CUT RES AMP LIM PAN`, envelope and LFO amounts and times (`EA1 AT1 HO1 DE1 EA2`... `LA1 LF1 LT1`...) and `SLI`. On a step without a note they change the note already playing. They come after the sequencer effects in the effect list (EDIT+UP or EDIT+DOWN on an effect), or EDIT+RIGHT past the last sequencer effect.
 - DRY, CHORUS, DELAY and REVERB are kept in the song but not played yet: there are no send effects. The M8's exact envelope times, LFO rates and filter curves aren't documented, so these are close, not exact.
 
 ## How songs are played

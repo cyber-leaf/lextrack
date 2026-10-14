@@ -80,6 +80,8 @@ impl Press {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Input {
     Press(Press),
+    /// A held letter button let go (only with release events).
+    Release(Button),
     Quit,
     None,
 }
@@ -99,6 +101,12 @@ impl Keys {
         if k.kind == KeyEventKind::Release {
             if let Some(c) = letter {
                 self.set_held(c, false);
+                if let Some(b) = letter_button(c) {
+                    return Input::Release(b);
+                }
+            }
+            if k.code == KeyCode::Enter {
+                return Input::Release(Button::Edit);
             }
             return Input::None;
         }
@@ -127,12 +135,8 @@ impl Keys {
             KeyCode::Char(c) => {
                 let shifted = c.is_ascii_uppercase();
                 held.shift |= shifted;
-                let b = match c.to_ascii_lowercase() {
-                    'a' => Button::Shift,
-                    's' => Button::Play,
-                    'z' => Button::Option,
-                    'x' => Button::Edit,
-                    _ => return Input::None,
+                let Some(b) = letter_button(c.to_ascii_lowercase()) else {
+                    return Input::None;
                 };
                 if repeat {
                     return Input::None;
@@ -168,6 +172,16 @@ impl Keys {
             _ => {}
         }
     }
+}
+
+fn letter_button(c: char) -> Option<Button> {
+    Some(match c {
+        'a' => Button::Shift,
+        's' => Button::Play,
+        'z' => Button::Option,
+        'x' => Button::Edit,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]

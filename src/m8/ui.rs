@@ -93,7 +93,7 @@ impl Kind {
 
     fn big_step(self) -> i32 {
         match self {
-            Kind::Note => 12,
+            Kind::Note | Kind::Transpose => 12,
             _ => 16,
         }
     }
@@ -210,6 +210,20 @@ struct Clip {
     kinds: Vec<Kind>,
     cells: Vec<Vec<u8>>,
 }
+
+/// The effect list: which cell it writes to and the highlighted effect.
+#[derive(Clone, Copy)]
+struct FxPick {
+    view: View,
+    row: usize,
+    col: usize,
+    cur: usize,
+}
+
+/// Effect list layout: names per column and the list's top-left corner.
+const FX_PICK_ROWS: usize = 16;
+const FX_PICK_X: usize = 13;
+const FX_PICK_Y: usize = 3;
 
 enum Modal {
     Plugins {
@@ -403,6 +417,8 @@ pub struct App {
     instrument: u8,
     inst_top: usize,
     table: usize,
+    /// The view SHIFT+LEFT goes back to from the table.
+    table_from: View,
     groove: usize,
     project_col: usize,
     /// 0 for the sample name, 1 for REC. on a sampler's SAMPLE row.
@@ -416,6 +432,8 @@ pub struct App {
     selection: Option<Selection>,
     clip: Option<Clip>,
     modal: Option<Modal>,
+    /// The effect list opened by EDIT+UP/DOWN on an effect.
+    fx_pick: Option<FxPick>,
     confirm: Option<(Instant, &'static str)>,
     status: Option<(String, Instant)>,
     preview: Option<(Instant, u8, i16)>,
@@ -460,6 +478,7 @@ impl App {
             instrument: 0,
             inst_top: 0,
             table: 0,
+            table_from: View::Instrument,
             groove: 0,
             project_col: 0,
             sample_col: 0,
@@ -471,6 +490,7 @@ impl App {
             selection: None,
             clip: None,
             modal: None,
+            fx_pick: None,
             confirm: None,
             status: None,
             preview: None,
@@ -691,6 +711,8 @@ impl App {
         let releases = RELEASE_EVENTS.load(Ordering::Relaxed);
         match self.keys.translate(k, releases) {
             Input::Quit => self.quit = true,
+            Input::Release(Button::Edit) if self.fx_pick.is_some() => self.choose_fx(),
+            Input::Release(_) => {}
             Input::Press(p) => {
                 if self.modal.is_some() && self.recording.is_none() {
                     self.modal_press(p);
@@ -703,6 +725,9 @@ impl App {
     }
 
     fn press(&mut self, p: Press) {
+        if self.fx_pick.is_some() {
+            return self.fx_pick_press(p);
+        }
         if self.recording.is_some() {
             return self.record_press(p);
         }
@@ -796,10 +821,13 @@ impl App {
         let cur = self.cur();
         let next = match (self.view, b) {
             (View::Song, Button::Right) => {
-                let chain = self.song.rows[cur.row][cur.col];
-                if chain == EMPTY {
-                    return self.flash("NO CHAIN HERE");
-                }
+                // An empty slot opens the nearest chain above it in the
+                // track, or chain 00.
+                let chain = (0..=cur.row)
+                    .rev()
+                    .map(|r| self.song.rows[r][cur.col])
+                    .find(|&c| c != EMPTY)
+                    .unwrap_or(0);
                 self.chain = chain as usize;
                 self.chain_ctx = Some(Ctx {
                     track: cur.col,
@@ -812,13 +840,16 @@ impl App {
             (View::Project, Button::Down) => View::Song,
             (View::Chain, Button::Left) => View::Song,
             (View::Chain, Button::Right) => {
-                let ph = self.song.chains[self.chain].steps[cur.row].phrase;
-                if ph == EMPTY {
-                    return self.flash("NO PHRASE HERE");
-                }
-                self.phrase = ph as usize;
+                // An empty step opens the nearest phrase above it.
+                let steps = &self.song.chains[self.chain].steps;
+                let Some(row) = (0..=cur.row).rev().find(|&r| steps[r].phrase != EMPTY) else {
+                    self.set_cur(Cursor { row: 0, ..cur });
+                    return self.flash("NO PHRASE IN CHAIN");
+                };
+                self.phrase = steps[row].phrase as usize;
+                self.set_cur(Cursor { row, ..cur });
                 self.phrase_ctx = self.chain_ctx.map(|c| Ctx {
-                    chain_step: cur.row,
+                    chain_step: row,
                     ..c
                 });
                 View::Phrase
@@ -840,6 +871,18 @@ impl App {
                 }
                 View::Chain
             }
+            (View::Phrase, Button::Right) if self.table_under_cursor().is_some() => {
+                self.table = self.table_under_cursor().unwrap() as usize;
+                self.table_from = View::Phrase;
+                View::Table
+            }
+            (View::Table, Button::Right) => {
+                let Some(t) = self.table_under_cursor() else {
+                    return;
+                };
+                self.table = t as usize;
+                View::Table
+            }
             (View::Phrase, Button::Right) => {
                 let steps = &self.song.phrases[self.phrase].steps;
                 let inst = (0..=cur.row)
@@ -850,18 +893,55 @@ impl App {
                 self.instrument = inst.min(INSTRUMENTS as u8 - 1);
                 View::Instrument
             }
-            (View::Phrase, Button::Up) => View::Groove,
+            (View::Phrase, Button::Up) => {
+                // The groove a GRV on or above the cursor row selects.
+                if let Some(g) = self.groove_in_phrase(cur.row) {
+                    self.groove = g as usize % GROOVES;
+                }
+                View::Groove
+            }
             (View::Groove, Button::Down) => View::Phrase,
             (View::Instrument, Button::Left) => View::Phrase,
             (View::Instrument, Button::Right) => {
                 self.table = self.instrument as usize;
+                self.table_from = View::Instrument;
                 View::Table
             }
-            (View::Table, Button::Left) => View::Instrument,
+            (View::Table, Button::Left) => {
+                if self.table_from == View::Instrument && self.table < INSTRUMENTS {
+                    self.instrument = self.table as u8;
+                }
+                self.table_from
+            }
             _ => return,
         };
         self.selection = None;
         self.view = next;
+    }
+
+    /// The table a TBL or TBX effect under the cursor points at.
+    fn table_under_cursor(&self) -> Option<u8> {
+        let c = self.cur();
+        if self.kind_at(c.col) != Some(Kind::FxCmd) {
+            return None;
+        }
+        let cmd = self.cell(self.view, c.row, c.col);
+        if cmd == EMPTY || !matches!(fx_name(cmd).as_str(), "TBL" | "TBX") {
+            return None;
+        }
+        Some(self.cell(self.view, c.row, c.col + 1))
+    }
+
+    /// The value of the last GRV effect on or above `row` of the phrase.
+    fn groove_in_phrase(&self, row: usize) -> Option<u8> {
+        let steps = &self.song.phrases[self.phrase].steps;
+        (0..=row).rev().find_map(|r| {
+            steps[r]
+                .fx
+                .iter()
+                .find(|f| f.command != EMPTY && fx_name(f.command) == "GRV")
+                .map(|f| f.value)
+        })
     }
 
     /// OPTION + direction: next/previous chain, phrase, instrument...
@@ -890,7 +970,13 @@ impl App {
                     }
                     ctx.row = r as usize;
                 } else {
-                    let t = ctx.track as i32 + step;
+                    // Skip tracks with no chain on this song row.
+                    let mut t = ctx.track as i32 + step;
+                    while (0..TRACKS as i32).contains(&t)
+                        && self.song.rows[ctx.row][t as usize] == EMPTY
+                    {
+                        t += step;
+                    }
                     if !(0..TRACKS as i32).contains(&t) {
                         return;
                     }
@@ -923,36 +1009,42 @@ impl App {
                         s += step;
                     }
                 } else {
-                    let t = ctx.track as i32 + step;
-                    if !(0..TRACKS as i32).contains(&t) {
-                        return;
-                    }
-                    ctx.track = t as usize;
-                    let chain = self.song.rows[ctx.row][ctx.track];
-                    if chain == EMPTY {
-                        return;
-                    }
-                    let steps = &self.song.chains[chain as usize].steps;
-                    let pick = if steps[ctx.chain_step].phrase != EMPTY {
-                        Some(ctx.chain_step)
-                    } else {
-                        (0..STEPS).find(|&s| steps[s].phrase != EMPTY)
-                    };
-                    if let Some(s) = pick {
-                        ctx.chain_step = s;
-                        self.phrase = steps[s].phrase as usize;
-                        self.phrase_ctx = Some(ctx);
+                    // Go on to the next track that has a phrase to show.
+                    let mut t = ctx.track as i32 + step;
+                    while (0..TRACKS as i32).contains(&t) {
+                        let chain = self.song.rows[ctx.row][t as usize];
+                        if chain != EMPTY {
+                            let steps = &self.song.chains[chain as usize].steps;
+                            let pick = if steps[ctx.chain_step].phrase != EMPTY {
+                                Some(ctx.chain_step)
+                            } else {
+                                (0..STEPS).find(|&s| steps[s].phrase != EMPTY)
+                            };
+                            if let Some(s) = pick {
+                                ctx.track = t as usize;
+                                ctx.chain_step = s;
+                                self.phrase = steps[s].phrase as usize;
+                                self.phrase_ctx = Some(ctx);
+                                return;
+                            }
+                        }
+                        t += step;
                     }
                 }
             }
+            // On the M8, OPTION+UP adds 16 here and OPTION+DOWN takes 16 off.
             View::Instrument => {
-                let d = if vertical { step * 16 } else { step };
+                let d = if vertical { -step * 16 } else { step };
                 self.instrument =
                     (self.instrument as i32 + d).clamp(0, INSTRUMENTS as i32 - 1) as u8;
             }
             View::Table => {
-                let d = if vertical { step * 16 } else { step };
+                let d = if vertical { -step * 16 } else { step };
                 self.table = (self.table as i32 + d).clamp(0, TABLES as i32 - 1) as usize;
+                // Instrument tables share their instrument's number.
+                if self.table < INSTRUMENTS {
+                    self.instrument = self.table as u8;
+                }
             }
             View::Groove => {
                 let d = if vertical { step * 16 } else { step };
@@ -1236,6 +1328,10 @@ impl App {
             return;
         };
         let val = self.cell(self.view, c.row, c.col);
+        if kind == Kind::FxCmd && matches!(b, Button::Up | Button::Down) {
+            // The M8 opens its effect list instead of stepping the command.
+            return self.open_fx_pick(c);
+        }
         if val == EMPTY && kind.can_be_empty() {
             let v = self.last.get(&kind).copied().unwrap_or(kind.default());
             return self.insert(c, kind, v);
@@ -1260,6 +1356,96 @@ impl App {
         self.last.insert(kind, v);
         if kind == Kind::Note {
             self.preview_step(c.row);
+        }
+    }
+
+    // --- effect list -------------------------------------------------------------
+
+    fn open_fx_pick(&mut self, c: Cursor) {
+        let all: Vec<u8> = fx_commands().collect();
+        let val = self.cell(self.view, c.row, c.col);
+        let start = if val == EMPTY {
+            self.last.get(&Kind::FxCmd).copied().unwrap_or(0)
+        } else {
+            val
+        };
+        self.fx_pick = Some(FxPick {
+            view: self.view,
+            row: c.row,
+            col: c.col,
+            cur: all.iter().position(|&f| f == start).unwrap_or(0),
+        });
+    }
+
+    /// Arrows move through the list (EDIT may stay held), EDIT or letting
+    /// go of EDIT picks, OPTION leaves it unchanged.
+    fn fx_pick_press(&mut self, p: Press) {
+        let len = fx_commands().count();
+        let Some(pick) = self.fx_pick.as_mut() else {
+            return;
+        };
+        let cur = pick.cur as i32;
+        let next = match p.button {
+            Button::Up => cur - 1,
+            Button::Down => cur + 1,
+            Button::Left => cur - FX_PICK_ROWS as i32,
+            Button::Right => cur + FX_PICK_ROWS as i32,
+            Button::Edit => return self.choose_fx(),
+            Button::Option => {
+                self.fx_pick = None;
+                return;
+            }
+            _ => return,
+        };
+        if (0..len as i32).contains(&next) {
+            pick.cur = next as usize;
+        }
+    }
+
+    fn choose_fx(&mut self) {
+        let Some(pick) = self.fx_pick.take() else {
+            return;
+        };
+        let Some(cmd) = fx_commands().nth(pick.cur) else {
+            return;
+        };
+        if pick.view != self.view {
+            return;
+        }
+        let c = Cursor {
+            row: pick.row,
+            col: pick.col,
+        };
+        if self.cell(self.view, c.row, c.col) == EMPTY {
+            self.insert(c, Kind::FxCmd, cmd);
+        } else {
+            self.set_cell(self.view, c.row, c.col, cmd);
+        }
+        self.last.insert(Kind::FxCmd, cmd);
+    }
+
+    fn draw_fx_pick(&self, s: &mut Screen) {
+        let Some(pick) = self.fx_pick else {
+            return;
+        };
+        let cols = fx_commands().count().div_ceil(FX_PICK_ROWS);
+        let width = cols * 4 + 1;
+        for y in FX_PICK_Y - 1..=FX_PICK_Y + FX_PICK_ROWS {
+            s.text(FX_PICK_X - 1, y, &" ".repeat(width + 1), Role::Background);
+            s.highlight(FX_PICK_X - 1, y, width + 1, Role::Background);
+        }
+        for (i, cmd) in fx_commands().enumerate() {
+            let x = FX_PICK_X + (i / FX_PICK_ROWS) * 4;
+            let y = FX_PICK_Y + i % FX_PICK_ROWS;
+            let role = if i == pick.cur {
+                Role::Value
+            } else {
+                Role::Info
+            };
+            s.text(x, y, &fx_name(cmd), role);
+            if i == pick.cur {
+                s.highlight(x, y, 3, Role::Cursor);
+            }
         }
     }
 
@@ -2515,6 +2701,7 @@ impl App {
             View::Groove => self.draw_groove(s),
             View::Project => self.draw_project(s),
         }
+        self.draw_fx_pick(s);
         self.draw_panel(s);
         self.draw_status(s);
     }
@@ -3325,6 +3512,7 @@ mod tests {
             instrument: 0,
             inst_top: 0,
             table: 0,
+            table_from: View::Instrument,
             groove: 0,
             project_col: 0,
             sample_col: 0,
@@ -3336,6 +3524,7 @@ mod tests {
             selection: None,
             clip: None,
             modal: None,
+            fx_pick: None,
             confirm: None,
             status: None,
             preview: None,
@@ -3585,12 +3774,84 @@ mod tests {
         a.view = View::Phrase;
         a.set_cur(Cursor { row: 0, col: 3 });
         tap(&mut a, Button::Edit);
+        assert_eq!(a.song.phrases[0].steps[0].fx[0].command, 0);
+        // EDIT+RIGHT steps through the effects.
+        with(&mut a, Button::Right, |h| h.edit = true);
+        assert_eq!(a.song.phrases[0].steps[0].fx[0].command, 1);
+        // EDIT+UP opens the effect list; arrows move a column at a time.
         with(&mut a, Button::Up, |h| h.edit = true);
-        assert_eq!(a.song.phrases[0].steps[0].fx[0].command, 0x10);
+        assert!(a.fx_pick.is_some());
+        with(&mut a, Button::Right, |h| h.edit = true);
+        with(&mut a, Button::Right, |h| h.edit = true);
         with(&mut a, Button::Up, |h| h.edit = true);
+        // OPTION leaves the effect as it was.
+        tap(&mut a, Button::Option);
+        assert!(a.fx_pick.is_none());
+        assert_eq!(a.song.phrases[0].steps[0].fx[0].command, 1);
+        with(&mut a, Button::Down, |h| h.edit = true);
+        with(&mut a, Button::Right, |h| h.edit = true);
+        with(&mut a, Button::Right, |h| h.edit = true);
+        tap(&mut a, Button::Edit);
         // Past the sequencer effects come the sampler's, from 0x80.
-        assert_eq!(a.song.phrases[0].steps[0].fx[0].command, 0x89);
-        assert_eq!(fx_name(0x89), "CUT");
+        assert_eq!(a.song.phrases[0].steps[0].fx[0].command, 0x8a);
+        assert_eq!(fx_name(0x8a), "RES");
+    }
+
+    #[test]
+    fn navigation_follows_the_firmware() {
+        let mut a = app();
+        let shift = |h: &mut super::super::input::Held| h.shift = true;
+        let option = |h: &mut super::super::input::Held| h.option = true;
+        // SHIFT+RIGHT on an empty song slot opens the chain above it.
+        a.song.rows[0][2] = 5;
+        a.set_cur(Cursor { row: 3, col: 2 });
+        with(&mut a, Button::Right, shift);
+        assert_eq!((a.view, a.chain), (View::Chain, 5));
+        // ...and on an empty chain step, the phrase above it.
+        a.song.chains[5].steps[1].phrase = 7;
+        a.set_cur(Cursor { row: 4, col: 0 });
+        with(&mut a, Button::Right, shift);
+        assert_eq!((a.view, a.phrase), (View::Phrase, 7));
+        assert_eq!(a.phrase_ctx.unwrap().chain_step, 1);
+        // A TBL effect leads to its table, and SHIFT+LEFT comes back.
+        let tbl = SEQ_FX.iter().position(|&n| n == "TBL").unwrap() as u8;
+        a.song.phrases[7].steps[0].fx[1] = crate::m8::format::Fx {
+            command: tbl,
+            value: 0x21,
+        };
+        a.set_cur(Cursor { row: 0, col: 5 });
+        with(&mut a, Button::Right, shift);
+        assert_eq!((a.view, a.table), (View::Table, 0x21));
+        with(&mut a, Button::Left, shift);
+        assert_eq!(a.view, View::Phrase);
+        // OPTION+UP adds 16 to the instrument, OPTION+DOWN takes 16 off.
+        a.view = View::Instrument;
+        a.instrument = 2;
+        with(&mut a, Button::Up, option);
+        assert_eq!(a.instrument, 0x12);
+        with(&mut a, Button::Down, option);
+        assert_eq!(a.instrument, 2);
+        // In the chain, OPTION+RIGHT skips tracks with nothing on the row.
+        a.song.rows[0][6] = 9;
+        a.view = View::Chain;
+        a.chain_ctx = Some(Ctx {
+            track: 2,
+            row: 0,
+            chain_step: 0,
+        });
+        with(&mut a, Button::Right, option);
+        assert_eq!((a.chain, a.chain_ctx.unwrap().track), (9, 6));
+    }
+
+    #[test]
+    fn transpose_moves_by_octaves() {
+        let mut a = app();
+        a.view = View::Chain;
+        a.set_cur(Cursor { row: 0, col: 1 });
+        with(&mut a, Button::Up, |h| h.edit = true);
+        assert_eq!(a.song.chains[0].steps[0].transpose, 12);
+        with(&mut a, Button::Right, |h| h.edit = true);
+        assert_eq!(a.song.chains[0].steps[0].transpose, 13);
     }
 
     #[test]
